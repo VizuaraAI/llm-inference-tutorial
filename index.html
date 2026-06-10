@@ -162,6 +162,11 @@
   .tl .ttft{background:var(--violet);color:#fff;border-color:var(--violet)}
   .tl .dec{background:#fff;color:var(--muted)}
 
+  .deepdive{border:1px solid var(--lilac);background:linear-gradient(180deg,var(--lilac-2),#fff);border-radius:24px;padding:30px 30px 8px;margin:40px 0}
+  .deepdive .ribbon{display:inline-flex;align-items:center;gap:8px;font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#fff;background:var(--violet);padding:6px 14px;border-radius:999px}
+  .deepdive h3{margin-top:18px}
+  .mono-mask{font-family:'JetBrains Mono',monospace}
+  td.no{color:#b04a4a;font-weight:600}td.yes{color:#3f7d4a;font-weight:600}
   footer{padding:70px 28px 90px;text-align:center;color:var(--muted);border-top:1px solid var(--line);margin-top:40px}
   footer .big{font-family:'Fraunces',serif;font-size:30px;color:var(--ink);font-weight:400;font-style:italic;max-width:24ch;margin:0 auto 16px}
 
@@ -215,7 +220,7 @@
 
     <div class="toc">
       <a href="#example"><span class="num">00</span><span><span class="t">The running example</span><span class="d">An ERP chatbot that creates a purchase order</span></span></a>
-      <a href="#structured"><span class="num">01</span><span><span class="t">Forcing structured output</span><span class="d">JSON schema · guided decoding · logit biasing</span></span></a>
+      <a href="#structured"><span class="num">01</span><span><span class="t">Forcing structured output</span><span class="d">JSON schema · guided decoding · FSM deep dive</span></span></a>
       <a href="#evals"><span class="num">02</span><span><span class="t">The eval harness</span><span class="d">Golden set · synthetic edge set · production replay</span></span></a>
       <a href="#latency"><span class="num">03</span><span><span class="t">Latency profiling</span><span class="d">Prefill vs decode · TTFT · DP &amp; TP</span></span></a>
       <a href="#deploy"><span class="num">04</span><span><span class="t">Getting it to production</span><span class="d">Warm pools · canary · cache routing · guardrails</span></span></a>
@@ -261,7 +266,7 @@
       <div class="fig-frame">
         <img src="figures/02_structured_output.png" alt="Constraining the next-token distribution with a schema/grammar mask and logit biasing" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;02 — masking the token distribution&lt;/b&gt;&lt;/div&gt;'">
       </div>
-      <figcaption><b>Figure 1.</b> At each decode step the model proposes logits over every token. A <b>constraint layer</b> — a grammar / JSON-schema state machine — masks out tokens that would make the output invalid, so sampling can only ever pick a <em>legal</em> continuation. The result parses, every time.</figcaption>
+      <figcaption><b>Figure 1a.</b> At each decode step the model proposes logits over every token. A <b>constraint layer</b> — a grammar / JSON-schema state machine — masks out tokens that would make the output invalid, so sampling can only ever pick a <em>legal</em> continuation. The result parses, every time.</figcaption>
     </figure>
 
     <p>There are three techniques worth teaching, from softest to hardest guarantee.</p>
@@ -307,6 +312,66 @@ out = llm.generate(prompt, guided_decoding=GuidedDecodingParams(json=po_schema))
     <div class="note">
       <span class="label">The engineering tradeoff</span>
       <p>Constrained decoding isn't free: the FSM must compute a token mask at every step, which can add latency, and an over-tight grammar can <em>force</em> the model into a bad-but-valid answer (it will happily emit <code>"quantity": 1</code> just to stay legal). Rule of thumb: <strong>constrain the structure, not the judgement.</strong> Force the shape of the form; let the model choose the values — then catch bad values with evals (§2) and guardrails (§4).</p>
+    </div>
+
+    <!-- DEEP DIVE: FSM -->
+    <div class="deepdive" id="fsm">
+      <span class="ribbon"><span class="dot" style="background:#fff"></span>Deep dive</span>
+      <h3>How the FSM actually guarantees valid JSON</h3>
+      <p>The line <code>guided_decoding=GuidedDecodingParams(json=po_schema)</code> hides a small state machine sitting between the model's logits and the sampler. Here is exactly what it does — three stages, two at compile time and one that runs on <em>every</em> token.</p>
+
+      <figure>
+        <div class="fig-frame">
+          <img src="figures/16_constrained_pipeline.png" alt="Constrained decoding pipeline: compile time (schema → regex → DFA → index) and run time (logits → mask → sample → advance)" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;16 — constrained decoding pipeline&lt;/b&gt;&lt;/div&gt;'">
+        </div>
+        <figcaption><b>Figure 1b.</b> Compile time (once per schema): JSON Schema → regex → character DFA → an <b>index</b> mapping each FSM state to its legal tokens. Run time (every token): use the index to mask illegal tokens to −∞, softmax, sample, advance the FSM.</figcaption>
+      </figure>
+
+      <h4 style="font-family:'Fraunces',serif;font-weight:500;font-size:20px;margin:26px 0 4px">Stage 1–2 · Schema becomes a state machine</h4>
+      <p>The schema is compiled into a regular expression that matches <em>exactly</em> the legal strings, then into a deterministic finite automaton (DFA) over <strong>characters</strong>:</p>
+<pre><span class="c"># po_schema compiles to this regex (whitespace omitted):</span>
+\{"supplier":"[^"]*","item":"[^"]*","quantity":[1-9][0-9]*(,"currency":"(USD|EUR|INR)")?(,"delivery_date":"[0-9]{4}-[0-9]{2}-[0-9]{2}")?\}</pre>
+      <p>Two guarantees already fall out, <em>before any model runs</em>: <strong><code>[1-9]</code> for the first quantity digit</strong> makes <code>minimum:1</code> structural (a leading <code>0</code> is literally unwriteable), and <strong><code>item</code> sits between <code>supplier</code> and <code>quantity</code> with no skip-path</strong> — so the chat's <code>{"supplier":"Acme","quantity":200}</code> (which drops the required <code>item</code>) is <em>not in the language</em>. The FSM won't let the model close the brace until <code>item</code> exists.</p>
+
+      <h4 style="font-family:'Fraunces',serif;font-weight:500;font-size:20px;margin:26px 0 4px">Stage 3 · The index (the clever bit)</h4>
+      <p>The DFA is over characters, but the model emits multi-character <strong>tokens</strong>. So we precompute, <em>once</em>, for every FSM state: walk each vocabulary token's characters through the DFA and keep it only if the whole walk stays alive. The result is a dictionary <code>state → {legal token → next state}</code>. Run time is then just a lookup — no re-parsing the string.</p>
+
+      <h4 style="font-family:'Fraunces',serif;font-weight:500;font-size:20px;margin:26px 0 4px">Stage 4 · Masking the logits (with real numbers)</h4>
+      <p>Say we're at the state that expects the <code>currency</code> value, and the model's raw favourite token is <code>Acme</code> (a string fragment — illegal here). The index says only <code>{USD, EUR, INR, US}</code> are legal. Masking sets every other logit to −∞:</p>
+      <table>
+        <thead><tr><th>Token</th><th>Raw logit</th><th>After mask</th><th>exp()</th><th>Probability</th></tr></thead>
+        <tbody>
+          <tr><td class="mono-mask">Acme</td><td>4.0 (highest!)</td><td class="no">−∞</td><td>0</td><td class="no">0.000</td></tr>
+          <tr><td class="mono-mask">200</td><td>2.5</td><td class="no">−∞</td><td>0</td><td class="no">0.000</td></tr>
+          <tr><td class="mono-mask">USD</td><td>3.0</td><td class="yes">3.0</td><td>20.09</td><td class="yes">0.631</td></tr>
+          <tr><td class="mono-mask">US</td><td>2.0</td><td class="yes">2.0</td><td>7.39</td><td>0.232</td></tr>
+          <tr><td class="mono-mask">EUR</td><td>1.0</td><td class="yes">1.0</td><td>2.72</td><td>0.085</td></tr>
+          <tr><td class="mono-mask">INR</td><td>0.5</td><td class="yes">0.5</td><td>1.65</td><td>0.052</td></tr>
+        </tbody>
+      </table>
+      <p>The token the model <em>most</em> wanted (<code>Acme</code>, logit 4.0) now has probability <strong>exactly 0</strong>. Mass is renormalized over the legal four; the model picks <code>USD</code> and the FSM advances. The probability of invalid JSON isn't <em>small</em> — it's <strong>zero</strong>.</p>
+
+      <h4 style="font-family:'Fraunces',serif;font-weight:500;font-size:20px;margin:26px 0 4px">The enum collapse, and why tokenization doesn't matter</h4>
+      <p>If the model samples <code>US</code> instead of the whole <code>USD</code>, the FSM moves to a mid-word state where the <em>only</em> legal token in the entire vocabulary is <code>D</code>. Both tokenizations land in the same place:</p>
+<pre>path A:  ENUM0 --USD--> e_USD --"--> done        <span class="c"># one token</span>
+path B:  ENUM0 --US--> e_US --D--> e_USD --"--> done   <span class="c"># two tokens</span></pre>
+      <p>Because the grammar runs on <strong>characters</strong>, it's indifferent to how the tokenizer chopped the word — and a single merged token like <code>","</code> (close-quote + comma + open-quote) can cross a structural boundary cleanly. That's why multi-character and boundary-crossing tokens "just work."</p>
+
+      <div class="note" style="background:#fff">
+        <span class="label">Why it's a guarantee, not a hope</span>
+        <p>It's a proven invariant. Every legal token keeps the FSM in a <em>live</em> state (dead states were pruned at compile time, so an accept state is always still reachable), and <code>&lt;EOS&gt;</code> is legal <strong>only</strong> in an accept state. So the model can never stop mid-value or with an unclosed brace, and whenever it legally ends, the string is in the schema's language. ∎</p>
+      </div>
+
+      <h4 style="font-family:'Fraunces',serif;font-weight:500;font-size:20px;margin:26px 0 4px">The real backends vLLM plugs in</h4>
+      <table>
+        <thead><tr><th>Backend</th><th>Automaton</th><th>Key idea</th></tr></thead>
+        <tbody>
+          <tr><td><b>Outlines</b></td><td>regex → DFA</td><td>Precompute the <code>state → {token → next}</code> index so each step is an O(1) lookup. The paper (Willard &amp; Louf 2023) that made this practical.</td></tr>
+          <tr><td><b>XGrammar</b></td><td>CFG → pushdown</td><td>Splits context-independent vs context-dependent tokens, caches an adaptive mask, and overlaps mask-building with the GPU forward pass (≈ zero overhead). Handles nested JSON; often vLLM's default.</td></tr>
+          <tr><td><b>lm-format-enforcer</b></td><td>token-prefix filter</td><td>Walks the allowed-token tree with some whitespace/format slack — less rigid than a pure DFA.</td></tr>
+        </tbody>
+      </table>
+      <p style="color:var(--muted);font-size:14.5px">A full matrix-level walkthrough (toy 31-token vocabulary, complete DFA, the whole token-by-token trace) lives in <code>constrained-json-decoding-detailed-walkthrough.md</code> alongside this site's source.</p>
     </div>
   </section>
 
@@ -545,6 +610,60 @@ report = run_harness(model, golden + synthetic_edges + prod_replay)
       <li><b>Decode pool</b><span>GPUs tuned for memory bandwidth and large decode batches. They own the token-by-token stream (your TPOT) without any prefill ever barging in.</span></li>
     </ol>
 
+    <h3>Wait — what exactly is a “worker”?</h3>
+    <p>Good question, and the word is genuinely overloaded. Let's build it up from the silicon, because "pool", "worker", and "GPU" are <em>not</em> the same thing.</p>
+
+    <h4 style="font-family:'Fraunces',serif;font-weight:500;font-size:21px;margin:30px 0 4px">1 · First, what's inside one GPU</h4>
+    <p>A single GPU is two things bolted together: a slab of <strong>HBM (High-Bandwidth Memory, ~80&nbsp;GB of VRAM)</strong> and a grid of <strong>compute cores (SMs / tensor cores)</strong>. Your <strong>model weights</strong> and the growing <strong>KV cache</strong> both live in HBM; the math happens in the SMs. The fat pipe between them — memory bandwidth, ~3&nbsp;TB/s — is the thing decode is bottlenecked on (§3).</p>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/12_gpu_anatomy.png" alt="Anatomy of one GPU: HBM holding weights and KV cache, SMs for compute, the bandwidth between them" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;12 — inside one GPU&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 9a.</b> Inside a single GPU. Weights (fixed) and KV cache (grows every token) sit in HBM; compute happens in the SMs; the HBM↔SM bandwidth is the decode bottleneck. Two ports matter for us: <b>NVLink</b> to sibling GPUs in the same server, and the <b>NIC</b> out to the network.</figcaption>
+    </figure>
+
+    <h4 style="font-family:'Fraunces',serif;font-weight:500;font-size:21px;margin:30px 0 4px">2 · A worker is a process, not a GPU</h4>
+    <p>Here's the key idea that resolves the confusion: <strong>a worker is one software process that owns exactly one model replica.</strong> That replica might fit on <strong>one GPU</strong> — then the worker <em>is</em> one GPU. Or the model might be too big, so it's sharded with <strong>tensor parallelism across several GPUs</strong> — then a <em>single</em> worker drives, say, 4 GPUs that are wired together with NVLink and act as <strong>one unit on one request</strong>. So:</p>
+    <ul>
+      <li><strong>Worker = 1 GPU</strong> when the replica fits on one card.</li>
+      <li><strong>Worker = N GPUs (a TP group)</strong> when one replica is split across cards — they collaborate on the <em>same</em> request, exchanging activations over NVLink every layer.</li>
+      <li><strong>Many workers = data parallelism</strong> — independent replicas, each handling <em>different</em> requests. That's how you scale throughput.</li>
+    </ul>
+    <p>A <strong>pool</strong> (prefill pool, decode pool) is then just "a set of workers all doing the same job." A prefill worker can itself be 1 GPU or a TP group; same for decode.</p>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/13_worker.png" alt="A worker is one process owning one model replica, which may be one GPU or a tensor-parallel group of GPUs" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;13 — what is a worker&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 9b.</b> Left: a worker that is a single GPU. Right: a worker that is a tensor-parallel group of 4 GPUs acting as one replica on one request. Either way it's <em>one process owning one replica</em>. Running many such workers, each on its own requests, is data parallelism.</figcaption>
+    </figure>
+
+    <h4 style="font-family:'Fraunces',serif;font-weight:500;font-size:21px;margin:30px 0 4px">3 · How the KV cache actually moves</h4>
+    <p>When a prefill worker finishes, the prompt's KV cache is sitting in <em>its</em> GPU's HBM. The decode worker needs that exact data in <em>its</em> GPU's HBM. So the transfer is fundamentally a <strong>memory-to-memory copy between two GPUs' HBM</strong>. Two cases:</p>
+    <ul>
+      <li><strong>Same server</strong> — the two GPUs are in one box, connected by <strong>NVLink / NVSwitch</strong> (~900&nbsp;GB/s). The copy is a direct GPU-to-GPU transfer, very fast.</li>
+      <li><strong>Different servers</strong> — the GPUs are in different machines, so the data crosses the network. That's where <strong>RDMA</strong> comes in (next).</li>
+    </ul>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/14_kv_transfer.png" alt="KV cache transferred from the prefill GPU's HBM directly into the decode GPU's HBM over NVLink or RDMA" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;14 — KV-cache transfer, HBM to HBM&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 9c.</b> The handoff is an HBM→HBM move: the prompt's KV cache leaves the prefill GPU's memory and lands in the decode GPU's memory — over NVLink if they share a server, over RDMA if they don't. It has to be faster than the TTFT you saved, or the win evaporates.</figcaption>
+    </figure>
+
+    <h4 style="font-family:'Fraunces',serif;font-weight:500;font-size:21px;margin:30px 0 4px">4 · What RDMA is</h4>
+    <p><strong>RDMA = Remote Direct Memory Access.</strong> Normally, sending data between machines means copying it up through the CPU and the OS kernel's networking stack on both ends — several copies, lots of CPU involvement, latency. RDMA lets one machine's <strong>network card (NIC) read and write another machine's memory directly</strong>, bypassing the CPU and the kernel entirely (<em>zero-copy, kernel-bypass</em>). With <strong>GPUDirect RDMA</strong>, the NIC even talks straight to GPU memory, so the KV cache goes GPU&nbsp;→&nbsp;NIC&nbsp;→&nbsp;network&nbsp;→&nbsp;NIC&nbsp;→&nbsp;GPU with no CPU in the loop. It runs over <strong>InfiniBand</strong> or <strong>RoCE (RDMA over Converged Ethernet)</strong>. This is what makes cross-server KV transfer fast enough to be worth it.</p>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/15_rdma.png" alt="RDMA bypasses the CPU and OS kernel so a NIC can read and write remote GPU memory directly" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;15 — what is RDMA&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 9d.</b> Traditional networking copies data through CPU and kernel on both ends (slow). RDMA's NIC reads/writes remote memory directly, skipping the CPU and kernel — and with GPUDirect RDMA it reads/writes GPU HBM directly. That's the transport behind cross-server KV-cache handoff.</figcaption>
+    </figure>
+
+    <div class="note">
+      <span class="label">Putting the vocabulary together</span>
+      <p><strong>GPU</strong> = one chip (HBM + compute). <strong>Worker</strong> = one process owning one model replica, which is <em>1 GPU or a TP group of GPUs</em>. <strong>Pool</strong> = many workers doing the same job (all prefill, or all decode). <strong>KV transfer</strong> = copying the prompt's cache from a prefill worker's HBM into a decode worker's HBM — over NVLink within a server, or RDMA across servers.</p>
+    </div>
+
     <div class="grid g3">
       <div class="card"><span class="tag">Independence</span><h4>Scale each pool on its own SLO</h4><p>Long prompts, short answers (summarize an invoice) → add prefill GPUs. Short prompts, long answers (draft a vendor email) → add decode GPUs. No more one-size compromise.</p></div>
       <div class="card"><span class="tag">No interference</span><h4>TTFT and TPOT stop trading off</h4><p>A burst of heavy prefills can't stutter anyone's stream, because decode lives on different silicon. You hit both latency SLOs at once.</p></div>
@@ -561,60 +680,107 @@ report = run_harness(model, golden + synthetic_edges + prod_replay)
   <section id="design">
     <span class="kicker"><span class="dot"></span>06 · The design question</span>
     <h2>Design a low-latency, high-throughput LLM inference system</h2>
-    <p class="lead">Now we can answer the question a student should be able to whiteboard. The trick is to <strong>refuse to answer it as one question</strong> — and instead reason in three layers: <span class="em">runtime</span>, <span class="em">tooling</span>, and <span class="em">infra</span>.</p>
+    <p class="lead">This is <em>the</em> system-design question for an inference engineer, and the way to nail it in an interview is to <strong>refuse to answer it as one blob</strong>. Walk up a ladder: how fast on <strong>one GPU</strong> → how to add <strong>more GPUs</strong> → the full <strong>menu of tricks</strong> → how to <strong>deploy</strong> it → what to <strong>measure</strong>. Narrate where each piece comes from and the whole course snaps together.</p>
+
+    <div class="note" style="background:#fff">
+      <span class="label">Start by asking, not answering</span>
+      <p>Before you draw a single box, scope it. Five questions decide everything below: <strong>1)&nbsp;What's the workload?</strong> (interactive chat vs nightly batch) · <strong>2)&nbsp;What are the SLOs?</strong> (TTFT, tokens/sec, P99 — the “five numbers” from <b>Ch&nbsp;2</b>) · <strong>3)&nbsp;How big is the model — does it fit on one GPU?</strong> · <strong>4)&nbsp;Open weights or a closed API?</strong> · <strong>5)&nbsp;How much traffic, how bursty?</strong> We answer them for our ERP purchase-order chatbot as we climb.</p>
+    </div>
+
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/18_scaling_ladder.png" alt="Scaling ladder: one GPU, then multiple GPUs, then more parallelism, then a managed fleet" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;18 — scaling ladder&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 10.</b> The answer is a ladder, not a list. Saturate one GPU first, then add GPUs, then parallelism, then a managed fleet — and only climb as far as your SLOs and traffic actually demand. This is the spine of <b>Ch&nbsp;25: Scale to a Million Users</b>.</figcaption>
+    </figure>
+
+    <p>Keep one picture in your head the whole climb: the <strong>three layers</strong> — <em>runtime</em>, <em>tooling</em>, <em>infra</em> — from <b>Ch&nbsp;1: The Three Layers</b>. Every trick below lives in exactly one of them.</p>
 
     <figure>
       <div class="fig-frame">
         <img src="figures/10_three_layers.png" alt="Three-layer stack: runtime, tooling (vLLM), infra — pushing up the GPU roofline" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;10 — runtime / tooling / infra&lt;/b&gt;&lt;/div&gt;'">
       </div>
-      <figcaption><b>Figure 10.</b> The whole stack on one slide. The <b>runtime layer</b> makes each GPU do more per second; the <b>tooling layer</b> (vLLM) schedules and batches work efficiently; the <b>infra layer</b> keeps the fleet warm, safe, and correctly routed. Together they push up the GPU roofline → more tokens/sec at lower latency.</figcaption>
+      <figcaption><b>Figure 11.</b> The whole stack on one slide. <b>Runtime</b> makes each GPU do more per second; <b>tooling</b> (vLLM) schedules and batches it; <b>infra</b> keeps the fleet warm, safe, and routed. Together they push the GPU roofline up → more tokens/sec at lower latency.</figcaption>
     </figure>
 
-    <h3>Runtime layer — push up the GPU roofline</h3>
-    <p>This is where you make a single GPU do more useful work per second. Almost everything here is about the same enemy: <strong>decode is memory-bandwidth-bound</strong>, so you either move less data or do more math per byte moved.</p>
+    <h3>Layer 1 · How fast can we go on <em>one</em> GPU?</h3>
+    <p>Always start here — never reach for more hardware before one GPU is saturated. The north star is the <strong>roofline</strong> (<b>Ch&nbsp;3: The Roofline Is Our North Star</b>): every kernel is either <strong>compute-bound</strong> (limited by tensor-core FLOPs) or <strong>memory-bandwidth-bound</strong> (limited by how fast bytes move out of HBM — the GPU anatomy from <b>Ch&nbsp;6: The Machine</b>). For LLMs, <strong>prefill is compute-bound</strong> and <strong>decode is memory-bound</strong> (<b>Ch&nbsp;7: The Good and Evil of the KV&nbsp;Cache</b>). So the entire one-GPU game is: <em>move fewer bytes per token, or do more math per byte</em> — pushing the operating point up to the roofline.</p>
+
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/17_roofline.png" alt="The GPU roofline model with optimization techniques moving the operating point toward the compute ceiling" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;17 — the roofline&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 12.</b> The roofline. Decode starts low on the memory-bound slope; every runtime trick — bigger batches, quantization, smaller KV, FlashAttention, speculation — nudges the operating point up and right toward the compute ceiling. This one picture organizes all the optimizations below.</figcaption>
+    </figure>
+
+    <p>Here are the one-GPU knobs, each tagged with where we covered it and what it buys the ERP chatbot. They all attack the same enemy — <strong>decode is memory-bandwidth-bound</strong> — by moving fewer bytes or doing more math per byte:</p>
     <div class="grid g2">
       <div class="card">
-        <span class="tag">Attention variants</span>
-        <h4>MQA · GQA · MLA</h4>
-        <p>The KV cache is the bandwidth hog. <strong>Multi-Query</strong> and <strong>Grouped-Query Attention</strong> let many query heads share a few key/value heads — shrinking the KV cache dramatically. <strong>Multi-head Latent Attention (MLA)</strong> compresses KV into a low-rank latent. Smaller KV → bigger batches → more tokens/sec.</p>
+        <span class="tag">Ch 8 · across heads</span>
+        <h4>Attention variants: MHA → MQA → GQA → MLA</h4>
+        <p>The KV cache is the bandwidth hog. <strong>Multi-Query</strong> and <strong>Grouped-Query</strong> attention let many query heads share a few key/value heads — shrinking KV dramatically; <strong>MLA</strong> compresses KV into a low-rank latent. For the ERP bot's long system prompt, a smaller KV means bigger batches and more tokens/sec from the same card.</p>
       </div>
       <div class="card">
-        <span class="tag">Beyond attention</span>
-        <h4>Mamba / state-space models</h4>
-        <p>SSMs replace quadratic attention with a recurrent state of <em>fixed</em> size — no KV cache that grows with sequence length. Promising for very long contexts where attention's memory blows up.</p>
+        <span class="tag">Ch 9 · across tokens</span>
+        <h4>KV compression &amp; SSMs (Mamba)</h4>
+        <p>Shrink the cache <em>along the sequence</em>: sliding-window attention, KV eviction, summarization. Or drop attention entirely — <strong>state-space models (Mamba)</strong> keep a <em>fixed-size</em> recurrent state, so memory doesn't grow with that pasted email thread.</p>
       </div>
       <div class="card">
-        <span class="tag">Kernels</span>
+        <span class="tag">Ch 10 · kernels</span>
         <h4>FlashAttention + online softmax</h4>
-        <p>FlashAttention fuses attention into one kernel that never materializes the full N×N score matrix, computing softmax <strong>online</strong> in a single streaming pass. Less HBM traffic, less memory, faster prefill.</p>
+        <p>Fuse attention into one kernel that never materializes the full N×N score matrix, computing softmax <strong>online</strong> in a single streaming pass. Less HBM traffic, less memory, faster prefill — the win that shortens TTFT on long prompts.</p>
       </div>
       <div class="card">
-        <span class="tag">Precision</span>
-        <h4>Quantization</h4>
-        <p>Serve weights (and sometimes KV cache / activations) in INT8 / FP8 / INT4 instead of FP16. Fewer bytes to move per token directly attacks the decode bottleneck — and the model fits on fewer GPUs. Gate every quantization on the §2 harness.</p>
+        <span class="tag">Ch 13 · precision</span>
+        <h4>Quantization (INT8 / FP8 / INT4)</h4>
+        <p>Serve weights (and sometimes KV / activations) in fewer bits than FP16 — GPTQ, AWQ, GGUF, QAT. Fewer bytes per token directly attacks the decode bottleneck <em>and</em> fits the model on fewer GPUs. Always gate a new quantization on the §2 eval harness.</p>
       </div>
       <div class="card">
-        <span class="tag">Fewer forward passes</span>
+        <span class="tag">Ch 15 · fewer passes</span>
         <h4>Speculative decoding</h4>
-        <p>A small draft model proposes several tokens; the big model <em>verifies</em> them in one parallel pass. When the draft is right, you get multiple tokens for the price of one step — big TPOT wins with identical output quality.</p>
+        <p>A small draft model proposes several tokens; the big model <em>verifies</em> them in one parallel pass. When the draft is right you get multiple tokens per step — a big TPOT win with <em>identical</em> output, so the ERP form streams faster for free.</p>
       </div>
       <div class="card">
-        <span class="tag">Parallelism</span>
-        <h4>TP · PP · DP</h4>
-        <p>Tensor parallelism for single-request latency, pipeline parallelism to span layers across nodes, data parallelism for throughput. These are the levers from §3, now seen as runtime knobs.</p>
+        <span class="tag">Ch 11–12 · memory &amp; reuse</span>
+        <h4>PagedAttention, prefix cache, chunked prefill</h4>
+        <p>Engine-level wins on one GPU: <strong>PagedAttention</strong> stores KV in pages (no fragmentation → more concurrent users), <strong>prefix caching</strong> reuses the shared system-prompt KV, and <strong>chunked prefill</strong> interleaves a long prompt with ongoing decodes so it doesn't stall the stream.</p>
       </div>
     </div>
 
-    <h3>Tooling layer — vLLM</h3>
-    <p>The runtime tricks are useless if the server schedules work badly. The tooling layer is the <strong>inference engine</strong> that turns raw GPU capability into served tokens — and the reference answer is <strong>vLLM</strong>:</p>
+    <h3>Layer 2 · What if one GPU isn't enough? — parallelism</h3>
+    <p>You move to multiple GPUs for two distinct reasons: the model <strong>doesn't fit</strong> on one card, or one card <strong>can't keep up</strong> with traffic. These need different kinds of parallelism (<b>Ch&nbsp;16: Parallelism on the Roofline</b>). Recall the <strong>worker</strong> idea from §5: a worker is one process owning one replica, which may span several GPUs.</p>
     <div class="grid g3">
-      <div class="card"><span class="tag">Memory</span><h4>PagedAttention</h4><p>KV cache managed in pages like virtual memory — near-zero fragmentation, so you fit far more concurrent sequences in the same VRAM.</p></div>
-      <div class="card"><span class="tag">Scheduling</span><h4>Continuous batching</h4><p>New requests join the running batch token-by-token instead of waiting for a batch to drain. Keeps the GPU saturated → high throughput without wrecking latency.</p></div>
+      <div class="card"><span class="tag">Latency · fit</span><h4>Tensor parallelism (TP)</h4><p>Split each layer's matrices across GPUs in one server, joined by <strong>NVLink</strong>. They work the <em>same</em> request together → lower per-token latency and the model fits. Costs an all-reduce every layer, so keep TP inside one NVLink domain.</p></div>
+      <div class="card"><span class="tag">Capacity · big models</span><h4>Pipeline parallelism (PP)</h4><p>Put different <em>layers</em> on different nodes; tokens flow through the pipeline. Spans models too big even for one server's GPUs; needs enough in-flight work to keep every stage busy.</p></div>
+      <div class="card"><span class="tag">Throughput</span><h4>Data parallelism (DP)</h4><p>Replicate the whole model N times; each replica serves <em>different</em> requests. The straightforward throughput knob — more replicas, more concurrent ERP users.</p></div>
+      <div class="card"><span class="tag">MoE</span><h4>Expert parallelism (EP)</h4><p>For Mixture-of-Experts models, place different experts on different GPUs and route tokens to them. Scales sparse models without every GPU holding every expert.</p></div>
+      <div class="card"><span class="tag">Long context</span><h4>Sequence / context parallelism</h4><p>Split a very long sequence across GPUs so no single card holds the whole KV — what you reach for when an ERP user pastes a giant document.</p></div>
+      <div class="card"><span class="tag">Ch 17 · architecture</span><h4>Disaggregated prefill / decode</h4><p>The big structural move from §5: prefill and decode on <em>separate</em> pools, KV shipped over NVLink/RDMA, so a heavy prefill never stutters anyone's stream. Scale each pool on its own SLO.</p></div>
+    </div>
+    <div class="note">
+      <span class="label">The rule of thumb</span>
+      <p>Climb in this order: <strong>fit + saturate one GPU → TP within a server → DP for more users → PP across servers only if the model demands it → disaggregate when prefill/decode interference shows up in your P99.</strong> Don't add a parallelism dimension until the simpler one is genuinely maxed — every extra dimension adds communication and ops cost.</p>
+    </div>
+
+    <h3>Layer 3 · Pick the engine (the tooling layer)</h3>
+    <p>The runtime and parallelism tricks are useless if the server schedules work badly. The <strong>inference engine</strong> turns raw GPU capability into served tokens. The reference default is <strong>vLLM</strong> (its core wins below; the request lifecycle is <b>Ch&nbsp;19: Anatomy of a vLLM Step</b>), but it's one of several (<b>Ch&nbsp;20: The Engine Landscape</b>):</p>
+    <div class="grid g3">
+      <div class="card"><span class="tag">Memory</span><h4>PagedAttention</h4><p>KV cache managed in pages like virtual memory — near-zero fragmentation, so far more concurrent sequences fit in the same VRAM.</p></div>
+      <div class="card"><span class="tag">Scheduling</span><h4>Continuous batching</h4><p>New requests join the running batch token-by-token instead of waiting for it to drain (<b>Ch&nbsp;14</b>). Keeps the GPU saturated → high throughput without wrecking latency.</p></div>
       <div class="card"><span class="tag">Reuse</span><h4>Prefix caching + guided decoding</h4><p>Automatic prefix-cache reuse (§4) and built-in JSON-schema/grammar decoding (§1) — the engine implements the steering and caching we designed.</p></div>
     </div>
+    <table>
+      <thead><tr><th>Engine</th><th>Sweet spot</th><th>Reach for it when…</th></tr></thead>
+      <tbody>
+        <tr><td><b>vLLM</b></td><td>General-purpose, open, fast-moving</td><td>your default for self-hosting open weights — great throughput, huge model coverage, guided decoding built in.</td></tr>
+        <tr><td><b>SGLang</b></td><td>Structured generation, RadixAttention</td><td>heavy structured output / agentic workloads with lots of shared prefixes (our ERP tool-schema prefix loves RadixAttention).</td></tr>
+        <tr><td><b>TensorRT-LLM</b></td><td>Squeeze every last ms on NVIDIA</td><td>you've fixed the model and want compiled, hardware-tuned kernels for the lowest latency.</td></tr>
+        <tr><td><b>TGI · LMDeploy · llama.cpp</b></td><td>HF stack · efficiency · on-device/CPU</td><td>tight HF integration, or running quantized models on small/edge/Apple-Silicon hardware.</td></tr>
+      </tbody>
+    </table>
 
-    <h3>Infra layer — keep the fleet warm, safe, routed</h3>
-    <p>Finally, the layer from §4 — the operational reality that surrounds the engine:</p>
+    <h3>Layer 4 · Deployment — keep the fleet warm, safe, routed</h3>
+    <p>An engine on a GPU is not a product. The <strong>infra layer</strong> from §4 is the operational reality around it (<b>Ch&nbsp;18: Replication, Routing, Multi-Region</b> and Track&nbsp;6: <em>Production Inference Systems</em>):</p>
     <div class="grid g3">
       <div class="card"><span class="tag">Availability</span><h4>Warm pools &amp; autoscaling</h4><p>No cold starts for interactive traffic; pre-scale ahead of demand; scale-to-zero only for batch.</p></div>
       <div class="card"><span class="tag">Safety of change</span><h4>Canary deploys</h4><p>Ship behind an eval-gated traffic split; promote or roll back automatically.</p></div>
@@ -625,10 +791,70 @@ report = run_harness(model, golden + synthetic_edges + prod_replay)
       <div class="card"><span class="tag">Truth</span><h4>Evals &amp; observability</h4><p>The harness from §2 running continuously on replayed traffic — the gate every other infra decision leans on.</p></div>
     </div>
 
-    <div class="note">
-      <span class="label">Tying it all together</span>
-      <p>Walk it back through the chatbot. A user says <em>“create a PO for 200 bolts.”</em> The request lands on a <strong>warm</strong> vLLM replica (infra) chosen by a <strong>cache-aware router</strong> so the system-prompt prefix is already cached (infra + tooling). The engine runs <strong>continuous batching</strong> with a <strong>quantized, GQA</strong> model and <strong>speculative decoding</strong> for low TPOT (tooling + runtime). <strong>Guided decoding</strong> forces a valid PO form (steering), <strong>guardrails</strong> check the business rules (infra), and — because the prompt is long but the form is short — prefill runs on a <strong>disaggregated</strong> pool so no one's token stream stutters (infra). The whole version was promoted only because it passed an <strong>eval-gated canary</strong> (evals + infra). Low latency and high throughput aren't one trick — they're <em>every</em> layer doing its job.</p>
+    <h4 style="font-family:'Fraunces',serif;font-weight:500;font-size:22px;margin:34px 0 4px">The fork every deployment hits: self-host or API?</h4>
+    <p>Question 4 from the top — <strong>open weights or closed API?</strong> — splits the whole design in two. It's the single biggest architectural decision, so answer it explicitly in the interview.</p>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/19_oss_vs_closed.png" alt="Open-source self-hosted deployment versus closed-source API deployment, side by side" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;19 — self-host vs API&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 13.</b> Two ways to ship the ERP chatbot. Self-hosting open weights means <em>you</em> own everything in Layers 1–4; a closed API means the provider owns the GPUs and you own the prompt, schema, and guardrails.</figcaption>
+    </figure>
+    <div class="grid g2">
+      <div class="card">
+        <span class="tag">Self-hosted · open weights</span>
+        <h4>You run it</h4>
+        <p><strong>Stack:</strong> your (or rented cloud) GPUs · an engine like <strong>vLLM / SGLang / TensorRT-LLM</strong> · open weights (<strong>Llama, Qwen, Mistral, DeepSeek</strong>). <strong>You own</strong> every knob in this section — batching, quantization, parallelism, disaggregation, warm pools, routing, guardrails.</p>
+        <p style="margin-top:10px"><b>Pick it for:</b> data privacy (the PO data never leaves your walls), cost at high steady volume, deep customization (fine-tunes, custom quantization), and predictable latency. <b>The price:</b> you operate the whole thing — this entire tutorial <em>is</em> your job.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Closed API · managed</span>
+        <h4>They run it</h4>
+        <p><strong>Stack:</strong> a provider endpoint (<strong>OpenAI, Anthropic, Google</strong>). You send a prompt + JSON schema; they own the GPUs, batching, scaling, and frontier model. Layers 1–4 are <em>their</em> problem.</p>
+        <p style="margin-top:10px"><b>Pick it for:</b> zero ops, instant elastic scale, and best-in-class quality with no GPU to babysit — ideal early, or for bursty/low-volume traffic. <b>The price:</b> per-token cost that grows with usage, data leaving your perimeter (a real ERP concern), rate limits, and little control over latency or the model underneath.</p>
+      </div>
     </div>
+    <div class="note" style="background:#fff">
+      <span class="label">The honest answer in an interview</span>
+      <p>“It depends, and here's the hinge”: <strong>start on a closed API</strong> to ship fast and learn the traffic, then <strong>migrate the hot path to self-hosted open weights</strong> once volume, privacy, or cost justify owning the stack. Many real ERP systems run <em>both</em> — a cheap self-hosted open model for the 90% routine POs, an API call to a frontier model for the gnarly 10% (intent routing, <b>Ch&nbsp;25</b>).</p>
+    </div>
+
+    <h3>Layer 5 · What do we measure &amp; evaluate?</h3>
+    <p>You haven't designed anything until you've said how you'll <em>know it works</em>. Two halves: performance numbers and output quality.</p>
+    <div class="grid g2">
+      <div class="card">
+        <span class="tag">Ch 2 · the five numbers</span>
+        <h4>Performance SLOs</h4>
+        <p><strong>TTFT</strong> (time to first token) · <strong>ITL/TPOT</strong> (inter-token latency) · <strong>throughput</strong> (tokens/sec, requests/sec) · <strong>P99 latency</strong> (the tail users feel) · <strong>cost per million tokens</strong>. Profile prefill vs decode separately (§3); every Layer 1–4 choice is justified by moving one of these.</p>
+      </div>
+      <div class="card">
+        <span class="tag">§2 · the harness</span>
+        <h4>Output quality</h4>
+        <p>The eval harness — <strong>golden set, synthetic edge set, production replay</strong>, scored <strong>field-by-field</strong>. Schema-valid % and per-field accuracy. This is the gate that makes every other change safe: quantization, a new engine, a canary promotion all ship only if the harness holds.</p>
+      </div>
+    </div>
+    <div class="note">
+      <span class="label">Close the loop</span>
+      <p>Performance and quality are coupled, and you trade them against cost. Quantizing (Layer 1) cuts latency and cost but might drop field accuracy — so you <em>measure both</em> and let the harness + SLOs decide. That feedback loop, not any single trick, is the system.</p>
+    </div>
+
+    <h3>Putting it together: the interview answer in one breath</h3>
+    <p>Walk it back through the chatbot, naming the layer and the chapter as you go. A user says <em>“create a PO for 200 bolts.”</em> The request hits a <strong>warm</strong> replica (Layer 4 / Ch 18) chosen by a <strong>cache-aware router</strong> so the long system-prompt prefix is already cached (Layer 3 / Ch 12). The engine runs <strong>continuous batching</strong> (Ch 14) on a <strong>GQA</strong> (Ch 8), <strong>quantized</strong> (Ch 13) model with <strong>FlashAttention</strong> (Ch 10) and <strong>speculative decoding</strong> (Ch 15) to stay high on the <strong>roofline</strong> (Ch 3). The model is <strong>tensor-parallel</strong> across the GPUs in its worker (Ch 16); because prompts are long and forms short, prefill runs on a <strong>disaggregated</strong> pool (Ch 17) so no stream stutters. <strong>Guided decoding</strong> forces a valid PO form (§1), <strong>guardrails</strong> enforce the business rules (§4), and this version shipped only because it passed an <strong>eval-gated canary</strong> (§2 + §4). We chose <strong>self-hosted vLLM on open weights</strong> for privacy and cost, falling back to a <strong>closed API</strong> for the hard 10%.</p>
+
+    <div class="note">
+      <span class="label">Where every piece came from in the course</span>
+      <p style="margin-bottom:10px">The whole point: nothing here is new — it's the course, applied. Use this map to answer “where did we cover this?”.</p>
+    </div>
+    <table>
+      <thead><tr><th>Layer of the answer</th><th>Techniques</th><th>Covered in</th></tr></thead>
+      <tbody>
+        <tr><td><b>1 · One GPU</b></td><td>Roofline · KV cache · MHA→MQA→GQA→MLA · SSM/Mamba · FlashAttention · quantization · speculative decoding · PagedAttention · prefix/chunked prefill</td><td>Ch 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 15</td></tr>
+        <tr><td><b>2 · Multiple GPUs</b></td><td>Tensor / pipeline / data / expert / sequence parallelism · disaggregated prefill-decode</td><td>Ch 16, 17</td></tr>
+        <tr><td><b>3 · The engine</b></td><td>Continuous batching · the vLLM step · engine landscape (vLLM, SGLang, TensorRT-LLM, TGI, llama.cpp)</td><td>Ch 14, 19, 20</td></tr>
+        <tr><td><b>4 · Deployment</b></td><td>Warm pools · canary · cache-aware routing · guardrails · self-host vs API · multi-region</td><td>Ch 18, Track 6 · §4</td></tr>
+        <tr><td><b>5 · Measure</b></td><td>TTFT, ITL, throughput, P99, $/Mtok · structured output &amp; the eval harness</td><td>Ch 2 · §1–§2</td></tr>
+      </tbody>
+    </table>
+    <p style="color:var(--muted);font-size:14.5px;margin-top:18px">Course companion: the <a href="https://vizuaraai.github.io/convolution-musical-journey/book.html"><em>Inference Engineering</em> book</a> and the <a href="https://vizuaraai.github.io/convolution-musical-journey/visual-walkthroughs.html">visual walkthroughs</a>.</p>
   </section>
 
 </main>
