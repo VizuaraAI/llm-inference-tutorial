@@ -903,6 +903,62 @@ report = run_harness(model, golden + synthetic_edges + prod_replay)
       </div>
     </div>
 
+    <h3>Can we do parallelism here?</h3>
+    <p>Yes — but you have to split the word in two. The <strong>parallelism from Layer&nbsp;2 (TP, PP, EP, sequence)</strong> is <em>model</em> parallelism: sharding one model across GPUs. That is <strong>locked</strong> — the provider already does it inside the endpoint and you can't touch it. But two other kinds of parallelism are entirely yours.</p>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/21_closed_parallelism.png" alt="On a closed API model parallelism is locked, but request-level data parallelism and workload decomposition are yours" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;21 — parallelism on a closed API&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 15.</b> Model parallelism (TP/PP/EP) lives inside the locked engine. What you control is <b>request-level data parallelism</b> (fan out concurrent calls) and <b>workload decomposition</b> (split one task into independent sub-tasks, run them in parallel, recombine).</figcaption>
+    </figure>
+    <div class="grid g2">
+      <div class="card">
+        <span class="tag">Yours · throughput</span>
+        <h4>Request-level data parallelism</h4>
+        <p>Fire many <em>independent</em> requests concurrently. The provider runs a huge <strong>data-parallel replica fleet</strong> behind the endpoint, so concurrency is how you exploit it — this is <em>DP</em> (Ch&nbsp;16) reappearing at the orchestration boundary. The ceiling is the provider's <strong>rate limits (RPM/TPM)</strong>, so add a request queue with backoff. It raises aggregate throughput; it does <em>not</em> speed up a single generation.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Yours · latency of a task</span>
+        <h4>Workload decomposition (map-reduce)</h4>
+        <p>Break <em>one</em> task into independent sub-tasks and run them at once. Summarize a 200-page contract by chunking it, summarizing each chunk in parallel (<strong>map</strong>), then combining (<strong>reduce</strong>); fire an agent's independent sub-questions together; or run <strong>parallel sampling / self-consistency</strong> (N completions, vote) to trade cost for quality. This genuinely cuts the <em>composite</em> task's latency even though each call is serial inside.</p>
+      </div>
+    </div>
+    <div class="note">
+      <span class="label">The distinction that earns points</span>
+      <p>“Can I parallelize?” → <strong>Model parallelism: no, it's the provider's.</strong> <strong>Data-parallel concurrency and task decomposition: yes, and they're my main throughput levers</strong> — capped by rate limits, and for big offline jobs handed wholesale to the provider's <strong>Batch API</strong> (§4 batch vs online). Pipeline-style overlap also works at the app layer: while request A is in its “critique” step, request B is in “draft.”</p>
+    </div>
+
+    <h3>Provider prompt caching, in detail (and yes — everyone offers it)</h3>
+    <p>This is the single highest-leverage closed-API optimization, so it's worth doing properly. Every ERP request you send repeats the same opening: a long <strong>system prompt + tool schema + few-shot examples</strong>, then a short user message. Recomputing that shared prefix on every call is pure waste — and the provider will skip it <em>if you let it</em>. That's <strong>prompt caching</strong>: the provider stores the KV cache for a prefix it has seen and reuses it, charging you a fraction for the cached part and returning the first token faster. It's literally <em>prefix caching</em> (Ch&nbsp;12) — you just trigger it from the client instead of running it.</p>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/22_prompt_caching.png" alt="Prompt caching: the static prefix is written to cache on the first call and read back cheaply on repeats" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;22 — provider prompt caching&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 16.</b> First call <b>writes</b> the static prefix's KV to the provider's cache; repeat calls <b>read</b> it back — skipping recomputation, billing the prefix at a deep discount, and cutting TTFT. The rule: static content first, dynamic content last, prefix byte-identical.</figcaption>
+    </figure>
+    <p><strong>Is it offered by the leading providers? Yes — all of them, though the mechanics differ:</strong></p>
+    <div class="grid g3">
+      <div class="card">
+        <span class="tag">Anthropic · Claude</span>
+        <h4>Explicit, breakpoint-based</h4>
+        <p>You mark up to <strong>4 cache breakpoints</strong> with <code>cache_control: {"type":"ephemeral"}</code> (order: tools → system → messages). Minimum <strong>~1,024 tokens</strong> (model-dependent, up to 4,096). <strong>Cache reads cost ~10%</strong> of normal input (a 90% discount); writes cost +25% (5-min) or +100% (1-hour TTL). Default TTL <strong>5 min</strong>, refreshed free on each hit. You can even <strong>pre-warm</strong> with <code>max_tokens:0</code>.</p>
+      </div>
+      <div class="card">
+        <span class="tag">OpenAI</span>
+        <h4>Automatic, zero-config</h4>
+        <p><strong>On by default</strong> — no code change, no write fee. Kicks in at <strong>≥1,024 tokens</strong>, matched by exact prefix. OpenAI cites up to <strong>~80% lower latency</strong> and a large cut in cached-input cost. Cache persists ~<strong>5–10 min idle, up to ~1 hour</strong> (longer on some models). Pass <code>prompt_cache_key</code> to improve hit routing.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Google · Gemini</span>
+        <h4>Implicit + explicit</h4>
+        <p><strong>Implicit caching</strong> is automatic on Gemini 2.5+ (best-effort discount). <strong>Explicit context caching</strong> (a <code>CachedContent</code> object) gives a <em>guaranteed</em> discount plus a per-hour <strong>storage fee</strong>; you set the <strong>TTL</strong> (default ~1 hour, configurable). Minimum <strong>~2,048–4,096 tokens</strong>.</p>
+      </div>
+    </div>
+    <div class="note">
+      <span class="label">The rule and the payoff</span>
+      <p><strong>How to actually get hits:</strong> put everything static (system prompt, tool schema, few-shot, the ERP catalog snippet) <em>first</em> and byte-identical, and the per-request user message <em>last</em>. One stray timestamp at the top breaks every hit. <strong>The payoff:</strong> a 100k-token cached system prompt read at Claude's 10% rate costs ~$0.05 instead of ~$0.50 — and arrives much faster. On a chatbot that re-sends the same 1–2k-token preamble on every turn, this is routinely the difference between a comfortable bill and an alarming one. Cache hits also don't count against rate limits, which loosens your concurrency ceiling from the parallelism point above.</p>
+    </div>
+
     <h3>Self-hosting trick → its closed-API equivalent</h3>
     <table>
       <thead><tr><th>What you'd do self-hosting</th><th>Covered in</th><th>Closed-API equivalent you control</th></tr></thead>
