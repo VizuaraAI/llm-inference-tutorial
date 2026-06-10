@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Don't just serve — steer. Designing low-latency, high-throughput LLM inference</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --cream:#FBF8E8;
+    --cream-2:#F4EFD8;
+    --ink:#1A1A17;
+    --ink-soft:#4A4A42;
+    --muted:#8A8778;
+    --lilac:#E7D8F8;
+    --lilac-2:#F0E7FB;
+    --violet:#6B4FA0;
+    --violet-deep:#4A3372;
+    --sage:#C9CDB7;
+    --line:#E3DDC4;
+    --maxw:1080px;
+    --radius:20px;
+    --shadow:0 1px 2px rgba(26,26,23,.04), 0 18px 50px -28px rgba(74,51,114,.28);
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--cream);color:var(--ink);
+    font-family:'Inter',system-ui,sans-serif;
+    font-size:18px;line-height:1.7;-webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+  }
+  ::selection{background:var(--lilac);color:var(--violet-deep)}
+
+  /* ---------- nav ---------- */
+  .nav{
+    position:sticky;top:0;z-index:50;
+    backdrop-filter:saturate(1.4) blur(12px);
+    background:rgba(251,248,232,.82);
+    border-bottom:1px solid var(--line);
+  }
+  .nav-inner{max-width:var(--maxw);margin:0 auto;padding:14px 28px;display:flex;align-items:center;gap:24px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:600;letter-spacing:-.01em}
+  .brand .wave{display:flex;align-items:flex-end;gap:2px;height:18px}
+  .brand .wave i{width:3px;background:var(--violet);border-radius:2px;animation:eq 1.2s ease-in-out infinite}
+  .brand .wave i:nth-child(1){height:6px;animation-delay:0s}
+  .brand .wave i:nth-child(2){height:14px;animation-delay:.15s}
+  .brand .wave i:nth-child(3){height:9px;animation-delay:.3s}
+  .brand .wave i:nth-child(4){height:17px;animation-delay:.45s}
+  .brand .wave i:nth-child(5){height:7px;animation-delay:.6s}
+  @keyframes eq{0%,100%{transform:scaleY(.6)}50%{transform:scaleY(1)}}
+  .nav-links{display:flex;gap:22px;margin-left:auto;font-size:14.5px;font-weight:500}
+  .nav-links a{color:var(--ink-soft);text-decoration:none}
+  .nav-links a:hover{color:var(--violet)}
+  @media(max-width:820px){.nav-links{display:none}}
+
+  /* ---------- layout ---------- */
+  main{max-width:var(--maxw);margin:0 auto;padding:0 28px}
+  section{padding:64px 0;border-top:1px solid transparent}
+  .kicker{
+    display:inline-flex;align-items:center;gap:9px;
+    font-size:12.5px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--violet);background:var(--lilac-2);
+    padding:7px 14px;border-radius:999px;border:1px solid var(--lilac);
+  }
+  .kicker .dot{width:7px;height:7px;border-radius:50%;background:var(--violet)}
+  h1,h2,h3{font-family:'Fraunces',serif;font-weight:500;letter-spacing:-.02em;line-height:1.06}
+  h2{font-size:clamp(32px,4.4vw,50px);margin:22px 0 10px}
+  h3{font-size:clamp(23px,2.6vw,30px);margin:42px 0 8px;font-weight:500}
+  .lead{font-size:21px;color:var(--ink-soft);max-width:62ch;margin:8px 0 0}
+  p{max-width:68ch}
+  a{color:var(--violet)}
+  strong{font-weight:600;color:var(--ink)}
+  .em{font-family:'Fraunces',serif;font-style:italic;font-weight:400}
+
+  /* ---------- hero ---------- */
+  .hero{padding:96px 0 56px;position:relative;overflow:hidden}
+  .hero h1{font-size:clamp(46px,8.5vw,104px);font-weight:400}
+  .hero h1 .accent{font-style:italic;font-weight:300;color:var(--ink)}
+  .hero h1 .grey{color:var(--muted)}
+  .hero .sub{font-size:clamp(19px,2.4vw,25px);color:var(--ink-soft);max-width:54ch;margin:28px 0 0}
+  .hero .pills{display:flex;flex-wrap:wrap;gap:10px;margin-top:34px}
+  .pill{font-size:14px;font-weight:500;padding:9px 16px;border-radius:999px;background:#fff;border:1px solid var(--line);color:var(--ink-soft)}
+  .pill.on{background:var(--lilac);border-color:var(--lilac);color:var(--violet-deep)}
+  .swirl{position:absolute;right:-60px;top:30px;width:280px;height:280px;opacity:.5;pointer-events:none}
+
+  /* ---------- figure ---------- */
+  figure{margin:34px 0 8px}
+  .fig-frame{
+    background:#fff;border:1px solid var(--line);border-radius:var(--radius);
+    padding:14px;box-shadow:var(--shadow);overflow:hidden;
+  }
+  .fig-frame img{width:100%;display:block;border-radius:12px}
+  .fig-pending{
+    display:flex;align-items:center;justify-content:center;gap:14px;
+    min-height:240px;color:var(--muted);font-size:15px;
+    background:repeating-linear-gradient(45deg,#fff,#fff 14px,var(--cream-2) 14px,var(--cream-2) 28px);
+    border-radius:12px;text-align:center;padding:30px;
+  }
+  figcaption{font-size:14.5px;color:var(--muted);margin-top:12px;padding-left:4px}
+  figcaption b{color:var(--ink-soft);font-weight:600}
+
+  /* ---------- callouts / cards ---------- */
+  .card{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:26px 28px;box-shadow:var(--shadow)}
+  .grid{display:grid;gap:18px}
+  .g2{grid-template-columns:1fr 1fr}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  @media(max-width:820px){.g2,.g3{grid-template-columns:1fr}}
+  .card h4{margin:0 0 6px;font-size:18px;font-weight:600;letter-spacing:-.01em}
+  .card .tag{font-size:12px;font-weight:600;letter-spacing:.1em;text-transform:uppercase;color:var(--violet)}
+  .card p{font-size:15.5px;color:var(--ink-soft);margin:8px 0 0}
+
+  .note{
+    border-left:3px solid var(--violet);background:var(--lilac-2);
+    border-radius:0 16px 16px 0;padding:18px 22px;margin:26px 0;
+  }
+  .note .label{font-weight:600;color:var(--violet-deep);font-size:13px;letter-spacing:.08em;text-transform:uppercase}
+  .note p{margin:6px 0 0;font-size:16px;color:var(--ink-soft)}
+
+  .bird{
+    background:linear-gradient(180deg,#fff,var(--cream));border:1px solid var(--line);
+    border-radius:var(--radius);padding:24px 26px;margin:26px 0;display:flex;gap:18px;align-items:flex-start;
+  }
+  .bird .ico{font-size:34px;line-height:1}
+
+  /* ---------- code ---------- */
+  pre{
+    background:#211C2E;color:#EDE6FA;border-radius:16px;padding:20px 22px;overflow-x:auto;
+    font-family:'JetBrains Mono',monospace;font-size:13.5px;line-height:1.65;margin:22px 0;
+    box-shadow:var(--shadow);
+  }
+  pre .c{color:#9b8ec4}      /* comment */
+  pre .k{color:#C7A8FF}      /* keyword */
+  pre .s{color:#B6E3B0}      /* string  */
+  pre .n{color:#F4C99A}      /* number/literal */
+  code{font-family:'JetBrains Mono',monospace;font-size:.88em;background:var(--cream-2);padding:2px 6px;border-radius:6px;color:var(--violet-deep)}
+  pre code{background:none;padding:0;color:inherit}
+
+  /* ---------- table ---------- */
+  table{width:100%;border-collapse:collapse;margin:22px 0;font-size:15px;background:#fff;border-radius:16px;overflow:hidden;border:1px solid var(--line)}
+  th,td{text-align:left;padding:13px 18px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--cream-2);font-weight:600;font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:var(--ink-soft)}
+  tr:last-child td{border-bottom:none}
+  td b{color:var(--ink)}
+
+  .steps{counter-reset:s;margin:26px 0;padding:0;list-style:none}
+  .steps li{counter-increment:s;position:relative;padding:14px 0 14px 56px;border-bottom:1px solid var(--line)}
+  .steps li:last-child{border-bottom:none}
+  .steps li::before{
+    content:counter(s);position:absolute;left:0;top:12px;width:36px;height:36px;border-radius:50%;
+    background:var(--lilac);color:var(--violet-deep);font-weight:600;display:flex;align-items:center;justify-content:center;
+    font-family:'Fraunces',serif;font-size:17px;
+  }
+  .steps li b{display:block;margin-bottom:2px}
+  .steps li span{color:var(--ink-soft);font-size:15.5px}
+
+  .tl{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}
+  .tl .seg{padding:8px 14px;border-radius:10px;font-size:13.5px;font-weight:500;border:1px solid var(--line);background:#fff}
+  .tl .prefill{background:var(--lilac);border-color:var(--lilac);color:var(--violet-deep)}
+  .tl .ttft{background:var(--violet);color:#fff;border-color:var(--violet)}
+  .tl .dec{background:#fff;color:var(--muted)}
+
+  footer{padding:70px 28px 90px;text-align:center;color:var(--muted);border-top:1px solid var(--line);margin-top:40px}
+  footer .big{font-family:'Fraunces',serif;font-size:30px;color:var(--ink);font-weight:400;font-style:italic;max-width:24ch;margin:0 auto 16px}
+
+  .divider{height:1px;background:linear-gradient(90deg,transparent,var(--line),transparent);margin:8px 0}
+  .toc{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:30px}
+  @media(max-width:820px){.toc{grid-template-columns:1fr}}
+  .toc a{display:flex;gap:12px;align-items:baseline;text-decoration:none;color:var(--ink);padding:13px 16px;border:1px solid var(--line);border-radius:14px;background:#fff}
+  .toc a:hover{border-color:var(--violet);background:var(--lilac-2)}
+  .toc a .num{font-family:'Fraunces',serif;color:var(--violet);font-size:15px;font-weight:600}
+  .toc a .t{font-size:15.5px;font-weight:500}
+  .toc a .d{display:block;font-size:13px;color:var(--muted);font-weight:400}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <div class="brand">
+      <span class="wave"><i></i><i></i><i></i><i></i><i></i></span>
+      Inference, end to end
+    </div>
+    <div class="nav-links">
+      <a href="#example">The example</a>
+      <a href="#structured">Structured output</a>
+      <a href="#evals">Evals</a>
+      <a href="#latency">Latency</a>
+      <a href="#deploy">Deployment</a>
+      <a href="#disagg">Disaggregation</a>
+      <a href="#design">The design</a>
+    </div>
+  </div>
+</nav>
+
+<main>
+
+  <!-- HERO -->
+  <header class="hero">
+    <span class="kicker"><span class="dot"></span>A teaching tutorial · LLM inference systems</span>
+    <h1>Don't just <span class="grey">serve</span><span class="accent"> — steer.</span></h1>
+    <p class="sub">A working model is the easy part. Turning it into a <span class="em">low-latency, high-throughput</span> product means shaping its output, measuring it honestly, and keeping the GPUs warm. We'll build the whole picture from one running example.</p>
+    <div class="pills">
+      <span class="pill on">Structured output</span>
+      <span class="pill on">Eval harness</span>
+      <span class="pill on">Latency profiling</span>
+      <span class="pill on">Cold starts &amp; warm pools</span>
+      <span class="pill on">Canary deploys</span>
+      <span class="pill on">Cache-aware routing</span>
+      <span class="pill on">Batch vs online</span>
+      <span class="pill on">Guardrails</span>
+    </div>
+
+    <div class="toc">
+      <a href="#example"><span class="num">00</span><span><span class="t">The running example</span><span class="d">An ERP chatbot that creates a purchase order</span></span></a>
+      <a href="#structured"><span class="num">01</span><span><span class="t">Forcing structured output</span><span class="d">JSON schema · guided decoding · logit biasing</span></span></a>
+      <a href="#evals"><span class="num">02</span><span><span class="t">The eval harness</span><span class="d">Golden set · synthetic edge set · production replay</span></span></a>
+      <a href="#latency"><span class="num">03</span><span><span class="t">Latency profiling</span><span class="d">Prefill vs decode · TTFT · DP &amp; TP</span></span></a>
+      <a href="#deploy"><span class="num">04</span><span><span class="t">Getting it to production</span><span class="d">Warm pools · canary · cache routing · guardrails</span></span></a>
+      <a href="#disagg"><span class="num">05</span><span><span class="t">Disaggregated inference</span><span class="d">Split prefill and decode into separate pools</span></span></a>
+      <a href="#design"><span class="num">06</span><span><span class="t">The design question</span><span class="d">Runtime · tooling · infra layers</span></span></a>
+    </div>
+  </header>
+
+  <!-- 00 EXAMPLE -->
+  <section id="example">
+    <span class="kicker"><span class="dot"></span>00 · The running example</span>
+    <h2>One sentence becomes a guided journey</h2>
+    <p class="lead">Everything below is anchored to a single concrete product: an <strong>ERP chatbot</strong> that lets a user create a purchase order by talking to it instead of clicking through twelve screens.</p>
+
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/01_hero_journey.png" alt="ERP purchase-order journey: a sentence becomes a structured form and guided next steps" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;01 — sentence → structured ERP journey&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 0.</b> The user says <em>“Create a direct purchase order for 200 steel bolts.”</em> The inference engine turns that free sentence into a <b>structured form</b> (Supplier, Item, Quantity, Unit&nbsp;price, Delivery&nbsp;date) and a sequence of <b>guided next-step cards</b>. This is the contract the rest of the system must protect.</figcaption>
+    </figure>
+
+    <p>Notice what the product actually demands. It is <em>not</em> “produce some helpful text.” It is:</p>
+    <ul>
+      <li>render a <strong>form with exactly these fields</strong>, in a shape the UI can bind to;</li>
+      <li>then emit <strong>“here's what you do next”</strong> steps, in order, every time;</li>
+      <li>and do it fast enough that the chat feels alive.</li>
+    </ul>
+    <p>So our job splits cleanly into three pressures, and the tutorial follows them in order: <strong>shape the output</strong> (§1), <strong>measure that you did</strong> (§2), and <strong>serve it fast and keep it up</strong> (§3–§4). §5 ties the whole stack together.</p>
+
+    <div class="note">
+      <span class="label">The mental model</span>
+      <p>Underneath, we've already implemented the parallelism that gets tokens out the door — <strong>data parallelism (DP)</strong> to handle many users at once and <strong>tensor parallelism (TP)</strong> to split a layer across GPUs. Those buy throughput. They do <em>nothing</em> to guarantee the output is a valid purchase-order form. That guarantee is a separate engineering problem — and it's where we start.</p>
+    </div>
+  </section>
+
+  <!-- 01 STRUCTURED OUTPUT -->
+  <section id="structured">
+    <span class="kicker"><span class="dot"></span>01 · Structured output</span>
+    <h2>Forcing the model to emit valid structure</h2>
+    <p class="lead">A free-running LLM samples the next token from a probability distribution over the whole vocabulary. Left alone, it will occasionally produce <code>"quantitiy": 200,,</code> — and your UI breaks. <span class="em">Steering</span> means making invalid tokens impossible, not merely unlikely.</p>
+
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/02_structured_output.png" alt="Constraining the next-token distribution with a schema/grammar mask and logit biasing" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;02 — masking the token distribution&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 1.</b> At each decode step the model proposes logits over every token. A <b>constraint layer</b> — a grammar / JSON-schema state machine — masks out tokens that would make the output invalid, so sampling can only ever pick a <em>legal</em> continuation. The result parses, every time.</figcaption>
+    </figure>
+
+    <p>There are three techniques worth teaching, from softest to hardest guarantee.</p>
+
+    <div class="grid g3">
+      <div class="card">
+        <span class="tag">Soft · steers</span>
+        <h4>Logit biasing</h4>
+        <p>Add or subtract a constant from specific tokens' logits <em>before</em> sampling. Push <code>"USD"</code>, <code>"EUR"</code>, <code>"INR"</code> up and everything else down when you're decoding the <code>currency</code> field; ban the <code>&lt;newline&gt;</code> token mid-value. Cheap, blunt, and it only nudges probabilities — it can't <em>guarantee</em> validity on its own.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Hard · constrains</span>
+        <h4>Grammar / guided decoding</h4>
+        <p>Compile a formal grammar (a regex or context-free grammar) into a <strong>finite-state machine</strong>. At each step the FSM says which tokens are even <em>reachable</em>; the rest are masked to <code>−∞</code>. After <code>"qty":</code> only digit tokens survive. This is what forces well-formed structure.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Hard · typed</span>
+        <h4>JSON-schema decoding</h4>
+        <p>The everyday version of guided decoding: hand the engine a JSON Schema for the purchase order and it constrains generation to emit exactly that object — right keys, right types, required fields present. vLLM, Outlines, and XGrammar all do this. <strong>Your form contract becomes the decoding constraint.</strong></p>
+      </div>
+    </div>
+
+    <h3>What it looks like in practice</h3>
+    <p>The schema <em>is</em> the form. You write it once and it does double duty: it documents the contract and it drives the decoder.</p>
+<pre><span class="c"># The purchase-order contract — also the decoding constraint</span>
+po_schema = {
+  <span class="s">"type"</span>: <span class="s">"object"</span>,
+  <span class="s">"properties"</span>: {
+    <span class="s">"supplier"</span>:      {<span class="s">"type"</span>: <span class="s">"string"</span>},
+    <span class="s">"item"</span>:          {<span class="s">"type"</span>: <span class="s">"string"</span>},
+    <span class="s">"quantity"</span>:      {<span class="s">"type"</span>: <span class="s">"integer"</span>, <span class="s">"minimum"</span>: <span class="n">1</span>},
+    <span class="s">"currency"</span>:      {<span class="s">"enum"</span>: [<span class="s">"USD"</span>, <span class="s">"EUR"</span>, <span class="s">"INR"</span>]},   <span class="c"># enum ⇒ only 3 legal continuations</span>
+    <span class="s">"delivery_date"</span>: {<span class="s">"type"</span>: <span class="s">"string"</span>, <span class="s">"format"</span>: <span class="s">"date"</span>}
+  },
+  <span class="s">"required"</span>: [<span class="s">"supplier"</span>, <span class="s">"item"</span>, <span class="s">"quantity"</span>],
+  <span class="s">"additionalProperties"</span>: <span class="k">False</span>
+}
+
+<span class="c"># vLLM: pass the schema as a guided-decoding constraint</span>
+out = llm.generate(prompt, guided_decoding=GuidedDecodingParams(json=po_schema))
+<span class="c"># 'out' is now guaranteed to parse as a PO object. No try/except JSON soup.</span></pre>
+
+    <div class="note">
+      <span class="label">The engineering tradeoff</span>
+      <p>Constrained decoding isn't free: the FSM must compute a token mask at every step, which can add latency, and an over-tight grammar can <em>force</em> the model into a bad-but-valid answer (it will happily emit <code>"quantity": 1</code> just to stay legal). Rule of thumb: <strong>constrain the structure, not the judgement.</strong> Force the shape of the form; let the model choose the values — then catch bad values with evals (§2) and guardrails (§4).</p>
+    </div>
+  </section>
+
+  <!-- 02 EVALS -->
+  <section id="evals">
+    <span class="kicker"><span class="dot"></span>02 · The eval harness</span>
+    <h2>Nothing works without an eval harness</h2>
+    <p class="lead">You cannot improve what you can't measure, and “it looked right when I tried it” is not measurement. Before deployment you need a <strong>ground-truth dataset from the team you're building for</strong> and an automated harness that scores the model against it — at the <span class="em">field level</span>.</p>
+
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/03_eval_harness.png" alt="Eval harness: golden set, synthetic edge set, production replay feeding field-level scoring" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;03 — eval harness &amp; field-level scorecard&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 2.</b> Three datasets feed one harness. It runs each input through the model, compares the emitted purchase-order JSON against the expected object <b>field by field</b>, and reports a scorecard — not a single fuzzy “quality” number.</figcaption>
+    </figure>
+
+    <h3>Three datasets, three jobs</h3>
+    <div class="grid g3">
+      <div class="card">
+        <span class="tag">The contract</span>
+        <h4>Golden set</h4>
+        <p>Small, <strong>human-reviewed</strong> examples that represent the product's contract. <em>“Create a PO for 200 steel bolts from Acme, deliver June 30”</em> → the exact expected JSON. This is where <strong>exact field-level checks</strong> belong. Curated by the ERP team, not invented by you.</p>
+      </div>
+      <div class="card">
+        <span class="tag">The stress test</span>
+        <h4>Synthetic edge set</h4>
+        <p>Generated adversarial variants: <strong>missing fields</strong>, <strong>weird dates</strong> (“next Tuesday”, “30 Feb”), <strong>long contexts</strong>, <strong>multilingual</strong> text, <strong>malformed tables</strong> pasted from email. These are the inputs handcrafted tests forget — so you generate them on purpose.</p>
+      </div>
+      <div class="card">
+        <span class="tag">The real world</span>
+        <h4>Production replay</h4>
+        <p><strong>Anonymized traffic samples</strong> replayed through new model versions. This is the only set that catches <strong>distribution drift</strong> — the way real users phrase requests slowly diverges from anything you imagined. Grows itself over time.</p>
+      </div>
+    </div>
+
+    <h3>What “field-level check” actually means</h3>
+    <p>A single pass/fail on the whole blob hides everything. Score each field, then aggregate. For our PO:</p>
+    <table>
+      <thead><tr><th>Field</th><th>Expected</th><th>Model output</th><th>Check</th><th>Result</th></tr></thead>
+      <tbody>
+        <tr><td><b>supplier</b></td><td>Acme Steel</td><td>Acme Steel</td><td>exact / normalized</td><td>✅ pass</td></tr>
+        <tr><td><b>item</b></td><td>steel bolts</td><td>steel bolts</td><td>exact</td><td>✅ pass</td></tr>
+        <tr><td><b>quantity</b></td><td>200</td><td>200</td><td>numeric equal</td><td>✅ pass</td></tr>
+        <tr><td><b>delivery_date</b></td><td>2026-06-30</td><td>2026-06-03</td><td>ISO date equal</td><td>❌ <b>fail</b></td></tr>
+        <tr><td><b>currency</b></td><td>USD</td><td>USD</td><td>enum</td><td>✅ pass</td></tr>
+      </tbody>
+    </table>
+    <p>That one failing row — a date the model misparsed — is invisible in a holistic score but obvious here, and it tells you <em>exactly</em> what to fix. A useful harness reports: <strong>schema-valid&nbsp;%</strong> (did it even parse?), <strong>per-field accuracy</strong>, and <strong>full-record exact-match&nbsp;%</strong>.</p>
+
+<pre><span class="c"># The harness is boring on purpose — boring is auditable</span>
+<span class="k">def</span> score(example, model_out):
+    valid = matches_schema(model_out, po_schema)        <span class="c"># did it parse at all?</span>
+    fields = {k: (model_out.get(k) == example.expected[k])
+              <span class="k">for</span> k <span class="k">in</span> example.expected}              <span class="c"># field-by-field</span>
+    <span class="k">return</span> {<span class="s">"schema_valid"</span>: valid,
+            <span class="s">"fields"</span>: fields,
+            <span class="s">"exact_match"</span>: valid <span class="k">and</span> all(fields.values())}
+
+<span class="c"># Run it on every dataset, gate deploys on the aggregate (see §4 canary)</span>
+report = run_harness(model, golden + synthetic_edges + prod_replay)
+<span class="k">assert</span> report.schema_valid_pct &gt; <span class="n">0.99</span>      <span class="c"># structure is non-negotiable</span>
+<span class="k">assert</span> report.field_acc[<span class="s">"delivery_date"</span>] &gt; <span class="n">0.95</span></pre>
+
+    <div class="note">
+      <span class="label">Why this comes before deployment</span>
+      <p>The harness is what makes every later decision <em>safe</em>. Canary promotion (§4) is just “did the eval score hold on live traffic?” A new quantization (§5) is only allowed if the harness says field accuracy didn't drop. Without it, every change is a guess.</p>
+    </div>
+  </section>
+
+  <!-- 03 LATENCY -->
+  <section id="latency">
+    <span class="kicker"><span class="dot"></span>03 · Latency profiling</span>
+    <h2>Know where the milliseconds go</h2>
+    <p class="lead">For a chatbot, two numbers decide whether it feels alive: <strong>time to first token (TTFT)</strong> — how long until <em>something</em> appears — and <strong>inter-token latency (TPOT)</strong> — how smoothly the rest streams. You profile to learn which one you're bleeding on.</p>
+
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/04_latency_profile.png" alt="Request timeline: prefill, TTFT, then decode ticks; DP and TP diagrams" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;04 — latency timeline, prefill vs decode&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 3.</b> A request is two phases. <b>Prefill</b> encodes the whole prompt in one big parallel pass (compute-bound). <b>Decode</b> then emits one token at a time (memory-bandwidth-bound). TTFT ≈ prefill time; TPOT governs the stream after that.</figcaption>
+    </figure>
+
+    <div class="tl">
+      <span class="seg prefill">Prefill — encode the prompt + tool schema</span>
+      <span class="seg ttft">▮ TTFT</span>
+      <span class="seg dec">tok</span><span class="seg dec">tok</span><span class="seg dec">tok</span><span class="seg dec">tok</span><span class="seg dec">tok</span><span class="seg dec">… decode (TPOT each)</span>
+    </div>
+
+    <h3>The two phases have opposite bottlenecks</h3>
+    <table>
+      <thead><tr><th>Phase</th><th>What happens</th><th>Bound by</th><th>What helps</th></tr></thead>
+      <tbody>
+        <tr><td><b>Prefill</b></td><td>All prompt tokens processed in parallel → KV cache + first token</td><td><b>Compute</b> (FLOPs)</td><td>Tensor parallelism, FlashAttention, fewer prompt tokens, prefix-cache reuse (§4)</td></tr>
+        <tr><td><b>Decode</b></td><td>One token per step, re-reading the whole KV cache each time</td><td><b>Memory bandwidth</b></td><td>Bigger batches (amortize weight reads), quantization, speculative decoding, GQA/MQA/MLA (§5)</td></tr>
+      </tbody>
+    </table>
+
+    <p>Our existing <strong>DP</strong> and <strong>TP</strong> map onto this directly:</p>
+    <div class="grid g2">
+      <div class="card">
+        <span class="tag">Throughput</span>
+        <h4>Data parallelism (DP)</h4>
+        <p>Full model replicated N times; each replica serves <em>different</em> requests. More replicas → more concurrent users → higher throughput. Doesn't speed up a single request.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Single-request latency</span>
+        <h4>Tensor parallelism (TP)</h4>
+        <p>One layer's matrices <em>split</em> across GPUs that work on the <em>same</em> request together. Shrinks per-token latency and lets a model too big for one GPU fit — at the cost of inter-GPU communication every layer.</p>
+      </div>
+    </div>
+
+    <div class="note">
+      <span class="label">Profile, don't guess</span>
+      <p>Measure TTFT and TPOT separately under realistic concurrency. If <strong>TTFT</strong> is your pain, attack prefill — cache the shared system-prompt prefix, trim the prompt, add TP. If <strong>TPOT</strong> is your pain, attack decode — raise batch size, quantize, add speculative decoding. The fixes live in different layers, so the diagnosis has to come first.</p>
+    </div>
+  </section>
+
+  <!-- 04 DEPLOYMENT -->
+  <section id="deploy">
+    <span class="kicker"><span class="dot"></span>04 · Getting it to production</span>
+    <h2>The model still isn't ready</h2>
+    <p class="lead">It generates valid forms, it passes the harness, you've profiled it. It is <em>still</em> not production. Five concerns stand between a good model and a good service: <strong>cold starts</strong>, <strong>canary deploys</strong>, <strong>cache-aware routing</strong>, <strong>batch vs online</strong>, and <strong>guardrails</strong>.</p>
+
+    <!-- cold starts -->
+    <h3>Cold starts &amp; keeping things warm</h3>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/05_cold_warm_start.png" alt="Cold start vs warm pool comparison with a vLLM DP=2 x TP=2 fleet" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;05 — cold start vs warm pool&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 4.</b> A cold worker pays for pod spin-up, loading tens of GB of weights from disk, KV-cache allocation, and CUDA-graph capture before it can answer. A warm worker has already paid all of it and answers immediately.</figcaption>
+    </figure>
+    <p>Assume our serving config is <strong>vLLM with DP=2 × TP=2</strong> — four GPUs, two replicas, each replica sharded across two cards. A <em>cold</em> request to a freshly scheduled pod walks the whole staircase:</p>
+    <ol class="steps">
+      <li><b>Pod / container scheduling</b><span>Kubernetes finds a node with 2 free GPUs.</span></li>
+      <li><b>Load weights from disk → GPU</b><span>Tens of GB copied into VRAM. The dominant cost — often tens of seconds.</span></li>
+      <li><b>Allocate the paged KV-cache pool</b><span>vLLM reserves GPU memory blocks for attention state.</span></li>
+      <li><b>CUDA-graph capture / warm-up pass</b><span>First few kernels are slow until graphs are captured and caches primed.</span></li>
+      <li><b>First token</b><span>Only now does the user get a reply.</span></li>
+    </ol>
+    <p>The fix is to <strong>never let the user hit a cold worker</strong>:</p>
+    <ul>
+      <li><strong>Keep a warm pool.</strong> Hold N replicas already loaded and pinned in GPU memory, weights resident, KV pool allocated, CUDA graphs captured.</li>
+      <li><strong>Set <code>min_replicas ≥ 1</code> (never scale to zero)</strong> for interactive traffic; scale-to-zero is for batch jobs that can wait.</li>
+      <li><strong>Keep-alive pings.</strong> A periodic synthetic request stops the OS/GPU from paging things out and keeps caches hot.</li>
+      <li><strong>Snapshot / fast-load weights</strong> (safetensors mmap, model caching on the node) so a <em>new</em> replica warms in seconds, not minutes.</li>
+      <li><strong>Pre-scale ahead of demand</strong> — spin up replicas <em>before</em> the morning traffic wave, not after latency already spiked.</li>
+    </ul>
+
+    <!-- canary -->
+    <h3>Canary deployments</h3>
+    <div class="bird">
+      <div class="ico">🐤</div>
+      <div>
+        <p style="margin:0"><strong>Where the name comes from.</strong> Coal miners carried a canary in a cage underground. The bird is more sensitive to toxic gas than humans — if it stopped singing, you evacuated <em>before</em> the gas reached you. A <strong>canary deployment</strong> is the same idea: expose a tiny, sacrificial slice of real traffic to the new model and watch it closely, so a bad release hurts 5% of requests instead of 100%.</p>
+      </div>
+    </div>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/06_canary_deploy.png" alt="Canary deployment: router splits 95/5 between stable and canary, metrics gate decides promote or roll back" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;06 — canary deployment&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 5.</b> The router sends most traffic (~90%) to the stable model and a small slice (~10%) to the canary. A monitoring gate watches error rate, p95 latency, <b>schema-valid&nbsp;%</b> and <b>eval score</b> on the canary's live traffic. Healthy → full rollout. Unhealthy → automatic roll back to v1.</figcaption>
+    </figure>
+    <p>This is exactly where §2's harness pays off: the canary's gate isn't vibes, it's <strong>“did the eval metrics hold on real traffic?”</strong> A typical ramp: 1% → 5% → 25% → 100%, pausing at each step to confirm the gate stays green.</p>
+
+    <!-- cache routing -->
+    <h3>Cache-aware routing</h3>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/07_cache_routing.png" alt="Cache-aware router sends requests sharing a prefix to the worker that already cached it" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;07 — cache-aware routing&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 6.</b> Every ERP chat request carries the <em>same</em> long system prompt + tool schema prefix. A cache-aware router hashes that prefix and sends matching requests to the worker that already holds it in its KV cache — a <b>prefix hit</b> — so the shared context is computed once, not once per request.</figcaption>
+    </figure>
+    <p>In our chatbot, the first ~1–2k tokens of every request are identical: the system prompt, the PO tool schema, the few-shot examples. Recomputing that prefix for every message is pure waste. Two complementary moves:</p>
+    <ul>
+      <li><strong>Prefix / KV caching</strong> (automatic in vLLM): the engine stores the KV cache for a prefix and reuses it for any request that shares it — slashing prefill cost and TTFT.</li>
+      <li><strong>Cache-aware routing</strong>: a naïve round-robin load balancer scatters requests randomly and destroys cache locality. A prefix-aware router instead sends requests with the same prefix to the <em>same</em> replica, turning misses into hits. The same logic applies to <strong>session affinity</strong> — keep one user's multi-turn conversation pinned to the worker that already has their history cached.</li>
+    </ul>
+
+    <!-- batch vs online -->
+    <h3>Batch vs online inference</h3>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/08_batch_vs_online.png" alt="Online interactive inference vs batch offline inference, two columns" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;08 — batch vs online inference&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 7.</b> Same model, two operating modes with opposite objectives. Online optimizes for latency; batch optimizes for cost-per-token and GPU utilization.</figcaption>
+    </figure>
+    <table>
+      <thead><tr><th></th><th>Online / interactive</th><th>Batch / offline</th></tr></thead>
+      <tbody>
+        <tr><td><b>Example</b></td><td>The live PO chatbot</td><td>Nightly: classify 1M historical POs, bulk-extract fields from a year of invoices</td></tr>
+        <tr><td><b>Optimize for</b></td><td>Low latency, low TTFT</td><td>$ / token, GPU utilization</td></tr>
+        <tr><td><b>Batch size</b></td><td>Small, formed on the fly (<b>continuous batching</b> merges live requests token-by-token)</td><td>Huge — pack the GPU to the brim</td></tr>
+        <tr><td><b>Latency target</b></td><td>Milliseconds matter</td><td>Doesn't matter; throughput is king</td></tr>
+        <tr><td><b>Scaling</b></td><td>Warm pool, min_replicas ≥ 1</td><td>Scale-to-zero between jobs is fine</td></tr>
+      </tbody>
+    </table>
+    <p>The lesson for students: <strong>the same weights serve both</strong>, but the <em>serving configuration</em> is completely different. Don't run your nightly bulk job on the latency-tuned online fleet, and don't make interactive users wait behind a giant batch.</p>
+
+    <!-- guardrails -->
+    <h3>Guardrails &amp; output filtering</h3>
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/09_guardrails.png" alt="Guardrail pipeline: schema validator, safety/PII filter, business-rule check, with a repair loop" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;09 — guardrails &amp; output filtering&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 8.</b> Constrained decoding makes the output <em>well-formed</em>; guardrails make it <em>safe and correct</em>. Raw output runs a gauntlet — schema validation, safety/PII filter, business-rule check — and anything that fails is repaired or re-asked before it ever reaches the user.</figcaption>
+    </figure>
+    <p>Decoding (§1) guarantees the JSON parses. It does <em>not</em> guarantee the values make business sense. Guardrails are the second wall:</p>
+    <div class="grid g2">
+      <div class="card"><span class="tag">Structural</span><h4>Schema validator</h4><p>Belt-and-suspenders re-check that the object matches <code>po_schema</code> even if decoding was unconstrained for some path.</p></div>
+      <div class="card"><span class="tag">Safety</span><h4>Safety / PII filter</h4><p>Strip or block leaked secrets, PII, prompt-injection echoes, or unsafe content before it's shown or stored.</p></div>
+      <div class="card"><span class="tag">Domain</span><h4>Business-rule check</h4><p>Is the supplier on the approved vendor list? Is the price within budget? Is the delivery date in the future? Rules the model can't be trusted to enforce.</p></div>
+      <div class="card"><span class="tag">Recovery</span><h4>Repair / re-ask loop</h4><p>On failure, don't crash — feed the violation back (<em>“price exceeds budget, ask the user to confirm”</em>) and regenerate. Graceful degradation beats a broken form.</p></div>
+    </div>
+  </section>
+
+  <!-- 05 DISAGGREGATED -->
+  <section id="disagg">
+    <span class="kicker"><span class="dot"></span>05 · Disaggregated inference</span>
+    <h2>Stop making prefill and decode fight</h2>
+    <p class="lead">Recall from §3 that a request has two phases with <em>opposite</em> bottlenecks: <strong>prefill</strong> is compute-bound and bursty, <strong>decode</strong> is memory-bandwidth-bound and steady. When they share the same GPU, they sabotage each other. <span class="em">Disaggregated inference</span> splits them onto separate pools.</p>
+
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/11_disaggregated.png" alt="Disaggregated inference: separate prefill and decode GPU pools with a KV-cache transfer between them" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;11 — disaggregated prefill / decode&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 9.</b> Instead of one pool interleaving both phases, a dedicated <b>prefill pool</b> encodes the prompt and produces the KV cache, which is shipped over a fast interconnect (NVLink&nbsp;/&nbsp;RDMA) to a dedicated <b>decode pool</b> that streams the answer. Each pool is sized and tuned for its own bottleneck.</figcaption>
+    </figure>
+
+    <h3>Why colocating them hurts</h3>
+    <p>With plain continuous batching (vLLM's scheduler, §4), live prefills and decodes are merged into the same GPU step. A long prompt — our ERP system prompt + tool schema + the user's pasted email is easily 1–2k tokens — triggers a heavy prefill that <strong>monopolizes the GPU</strong> for a beat. Every other user's token stream stalls behind it. The symptom is the one users hate most: <strong>jittery, stuttering output</strong> and spiky tail latency, even when average throughput looks fine.</p>
+
+    <h3>The disaggregated design</h3>
+    <ol class="steps">
+      <li><b>Prefill pool</b><span>GPUs tuned for throughput on big parallel matmuls. They ingest the prompt, build the KV cache, emit the first token (this <em>is</em> your TTFT), then hand off.</span></li>
+      <li><b>KV-cache transfer</b><span>The prompt's KV cache is moved to a decode worker over NVLink / NVLink-Switch / RDMA. The transfer must be fast enough that the handoff doesn't eat the latency you just saved.</span></li>
+      <li><b>Decode pool</b><span>GPUs tuned for memory bandwidth and large decode batches. They own the token-by-token stream (your TPOT) without any prefill ever barging in.</span></li>
+    </ol>
+
+    <div class="grid g3">
+      <div class="card"><span class="tag">Independence</span><h4>Scale each pool on its own SLO</h4><p>Long prompts, short answers (summarize an invoice) → add prefill GPUs. Short prompts, long answers (draft a vendor email) → add decode GPUs. No more one-size compromise.</p></div>
+      <div class="card"><span class="tag">No interference</span><h4>TTFT and TPOT stop trading off</h4><p>A burst of heavy prefills can't stutter anyone's stream, because decode lives on different silicon. You hit both latency SLOs at once.</p></div>
+      <div class="card"><span class="tag">Right tool</span><h4>Tune hardware per phase</h4><p>You can even use different GPU types or parallelism configs — e.g. heavier TP on prefill, bigger batches on decode — since the phases no longer share a worker.</p></div>
+    </div>
+
+    <div class="note">
+      <span class="label">When it's worth it</span>
+      <p>Disaggregation shines at <strong>scale</strong> and with <strong>skewed prompt/output lengths</strong> — exactly the ERP case, where prompts are long (system prompt + tables) but the structured form is short. It's the architecture behind systems like <em>DistServe</em> and <em>Mooncake</em>, and is increasingly a first-class mode in vLLM. The cost is real: you now operate two pools and a fast KV-transfer path. For a small single-node deployment, plain colocated continuous batching is simpler and fine — reach for disaggregation when prefill–decode interference actually shows up in your tail-latency numbers (which is why you profiled in §3).</p>
+    </div>
+  </section>
+
+  <!-- 06 DESIGN -->
+  <section id="design">
+    <span class="kicker"><span class="dot"></span>06 · The design question</span>
+    <h2>Design a low-latency, high-throughput LLM inference system</h2>
+    <p class="lead">Now we can answer the question a student should be able to whiteboard. The trick is to <strong>refuse to answer it as one question</strong> — and instead reason in three layers: <span class="em">runtime</span>, <span class="em">tooling</span>, and <span class="em">infra</span>.</p>
+
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/10_three_layers.png" alt="Three-layer stack: runtime, tooling (vLLM), infra — pushing up the GPU roofline" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;10 — runtime / tooling / infra&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 10.</b> The whole stack on one slide. The <b>runtime layer</b> makes each GPU do more per second; the <b>tooling layer</b> (vLLM) schedules and batches work efficiently; the <b>infra layer</b> keeps the fleet warm, safe, and correctly routed. Together they push up the GPU roofline → more tokens/sec at lower latency.</figcaption>
+    </figure>
+
+    <h3>Runtime layer — push up the GPU roofline</h3>
+    <p>This is where you make a single GPU do more useful work per second. Almost everything here is about the same enemy: <strong>decode is memory-bandwidth-bound</strong>, so you either move less data or do more math per byte moved.</p>
+    <div class="grid g2">
+      <div class="card">
+        <span class="tag">Attention variants</span>
+        <h4>MQA · GQA · MLA</h4>
+        <p>The KV cache is the bandwidth hog. <strong>Multi-Query</strong> and <strong>Grouped-Query Attention</strong> let many query heads share a few key/value heads — shrinking the KV cache dramatically. <strong>Multi-head Latent Attention (MLA)</strong> compresses KV into a low-rank latent. Smaller KV → bigger batches → more tokens/sec.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Beyond attention</span>
+        <h4>Mamba / state-space models</h4>
+        <p>SSMs replace quadratic attention with a recurrent state of <em>fixed</em> size — no KV cache that grows with sequence length. Promising for very long contexts where attention's memory blows up.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Kernels</span>
+        <h4>FlashAttention + online softmax</h4>
+        <p>FlashAttention fuses attention into one kernel that never materializes the full N×N score matrix, computing softmax <strong>online</strong> in a single streaming pass. Less HBM traffic, less memory, faster prefill.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Precision</span>
+        <h4>Quantization</h4>
+        <p>Serve weights (and sometimes KV cache / activations) in INT8 / FP8 / INT4 instead of FP16. Fewer bytes to move per token directly attacks the decode bottleneck — and the model fits on fewer GPUs. Gate every quantization on the §2 harness.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Fewer forward passes</span>
+        <h4>Speculative decoding</h4>
+        <p>A small draft model proposes several tokens; the big model <em>verifies</em> them in one parallel pass. When the draft is right, you get multiple tokens for the price of one step — big TPOT wins with identical output quality.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Parallelism</span>
+        <h4>TP · PP · DP</h4>
+        <p>Tensor parallelism for single-request latency, pipeline parallelism to span layers across nodes, data parallelism for throughput. These are the levers from §3, now seen as runtime knobs.</p>
+      </div>
+    </div>
+
+    <h3>Tooling layer — vLLM</h3>
+    <p>The runtime tricks are useless if the server schedules work badly. The tooling layer is the <strong>inference engine</strong> that turns raw GPU capability into served tokens — and the reference answer is <strong>vLLM</strong>:</p>
+    <div class="grid g3">
+      <div class="card"><span class="tag">Memory</span><h4>PagedAttention</h4><p>KV cache managed in pages like virtual memory — near-zero fragmentation, so you fit far more concurrent sequences in the same VRAM.</p></div>
+      <div class="card"><span class="tag">Scheduling</span><h4>Continuous batching</h4><p>New requests join the running batch token-by-token instead of waiting for a batch to drain. Keeps the GPU saturated → high throughput without wrecking latency.</p></div>
+      <div class="card"><span class="tag">Reuse</span><h4>Prefix caching + guided decoding</h4><p>Automatic prefix-cache reuse (§4) and built-in JSON-schema/grammar decoding (§1) — the engine implements the steering and caching we designed.</p></div>
+    </div>
+
+    <h3>Infra layer — keep the fleet warm, safe, routed</h3>
+    <p>Finally, the layer from §4 — the operational reality that surrounds the engine:</p>
+    <div class="grid g3">
+      <div class="card"><span class="tag">Availability</span><h4>Warm pools &amp; autoscaling</h4><p>No cold starts for interactive traffic; pre-scale ahead of demand; scale-to-zero only for batch.</p></div>
+      <div class="card"><span class="tag">Safety of change</span><h4>Canary deploys</h4><p>Ship behind an eval-gated traffic split; promote or roll back automatically.</p></div>
+      <div class="card"><span class="tag">Efficiency</span><h4>Cache-aware routing</h4><p>Route by prefix and session so shared context is computed once and conversations stay cache-hot.</p></div>
+      <div class="card"><span class="tag">Workload fit</span><h4>Batch vs online split</h4><p>Separate fleets and configs for interactive vs bulk; never mix their latency goals.</p></div>
+      <div class="card"><span class="tag">Architecture</span><h4>Disaggregated prefill / decode</h4><p>At scale, split the two phases onto separate pools (§5) so TTFT and TPOT stop trading off.</p></div>
+      <div class="card"><span class="tag">Trust</span><h4>Guardrails &amp; filtering</h4><p>Validate, filter, enforce business rules, and repair before output reaches the user.</p></div>
+      <div class="card"><span class="tag">Truth</span><h4>Evals &amp; observability</h4><p>The harness from §2 running continuously on replayed traffic — the gate every other infra decision leans on.</p></div>
+    </div>
+
+    <div class="note">
+      <span class="label">Tying it all together</span>
+      <p>Walk it back through the chatbot. A user says <em>“create a PO for 200 bolts.”</em> The request lands on a <strong>warm</strong> vLLM replica (infra) chosen by a <strong>cache-aware router</strong> so the system-prompt prefix is already cached (infra + tooling). The engine runs <strong>continuous batching</strong> with a <strong>quantized, GQA</strong> model and <strong>speculative decoding</strong> for low TPOT (tooling + runtime). <strong>Guided decoding</strong> forces a valid PO form (steering), <strong>guardrails</strong> check the business rules (infra), and — because the prompt is long but the form is short — prefill runs on a <strong>disaggregated</strong> pool so no one's token stream stutters (infra). The whole version was promoted only because it passed an <strong>eval-gated canary</strong> (evals + infra). Low latency and high throughput aren't one trick — they're <em>every</em> layer doing its job.</p>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <p class="big">“Don't just serve the model — steer it, measure it, and keep it warm.”</p>
+  <p>A teaching tutorial on LLM inference systems · grounded in an ERP purchase-order chatbot</p>
+</footer>
+
+</body>
+</html>
