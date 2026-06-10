@@ -196,6 +196,7 @@
       <a href="#deploy">Deployment</a>
       <a href="#disagg">Disaggregation</a>
       <a href="#design">The design</a>
+      <a href="#closed">Closed API</a>
     </div>
   </div>
 </nav>
@@ -225,7 +226,8 @@
       <a href="#latency"><span class="num">03</span><span><span class="t">Latency profiling</span><span class="d">Prefill vs decode · TTFT · DP &amp; TP</span></span></a>
       <a href="#deploy"><span class="num">04</span><span><span class="t">Getting it to production</span><span class="d">Warm pools · canary · cache routing · guardrails</span></span></a>
       <a href="#disagg"><span class="num">05</span><span><span class="t">Disaggregated inference</span><span class="d">Split prefill and decode into separate pools</span></span></a>
-      <a href="#design"><span class="num">06</span><span><span class="t">The design question</span><span class="d">Runtime · tooling · infra layers</span></span></a>
+      <a href="#design"><span class="num">06</span><span><span class="t">The design question</span><span class="d">One GPU → fleet · open vs closed source</span></span></a>
+      <a href="#closed"><span class="num">07</span><span><span class="t">Optimizing on a closed API</span><span class="d">What's left when you don't own the engine</span></span></a>
     </div>
   </header>
 
@@ -855,6 +857,83 @@ report = run_harness(model, golden + synthetic_edges + prod_replay)
       </tbody>
     </table>
     <p style="color:var(--muted);font-size:14.5px;margin-top:18px">Course companion: the <a href="https://vizuaraai.github.io/convolution-musical-journey/book.html"><em>Inference Engineering</em> book</a> and the <a href="https://vizuaraai.github.io/convolution-musical-journey/visual-walkthroughs.html">visual walkthroughs</a>.</p>
+  </section>
+
+  <!-- 07 CLOSED API -->
+  <section id="closed">
+    <span class="kicker"><span class="dot"></span>07 · Closed-source models</span>
+    <h2>When you don't own the engine</h2>
+    <p class="lead">Everything in Layers 1–3 assumed you run the model. On a <strong>closed API</strong> (OpenAI, Anthropic, Google) you don't — and a sharp student immediately asks: <em>then what's left to optimize?</em> No vLLM. No FlashAttention. No GQA/MQA/MLA swap. No quantization. No speculative decoding. The whole runtime and tooling layer is <strong>locked behind the endpoint</strong>. So is there anything an inference engineer can actually do? <span class="em">Yes — a lot.</span> The optimization surface just moves from the <em>engine</em> to the <em>boundary</em>.</p>
+
+    <figure>
+      <div class="fig-frame">
+        <img src="figures/20_closed_api_levers.png" alt="A locked closed-API box surrounded by the levers an engineer still controls: input, model choice, output, and the system around the call" onerror="this.parentElement.innerHTML='&lt;div class=fig-pending&gt;Figure rendering… &lt;b&gt;20 — closed-API levers&lt;/b&gt;&lt;/div&gt;'">
+      </div>
+      <figcaption><b>Figure 14.</b> The engine is a black box you can't open — but you control everything <em>around</em> it: how many tokens go in, which model you pick, how many tokens come out, and the caching/routing/eval system wrapping the call. That boundary is where closed-API engineers win or lose.</figcaption>
+    </figure>
+
+    <div class="note">
+      <span class="label">The reframe</span>
+      <p>Recall the one-GPU equation: <strong>total latency ≈ TTFT + (output tokens × inter-token latency)</strong>, and <strong>cost ≈ (input tokens + output tokens) × price</strong>. You can't shrink the provider's per-token latency or change their kernels — but every term except their constants is <em>yours</em>. The entire game becomes <strong>token economics</strong>: fewer tokens in, fewer tokens out, and don't make the call at all when you don't have to. The same roofline thinking from <b>Ch&nbsp;3</b> still applies — you're just reasoning about <em>their</em> cheap path instead of your kernels.</p>
+    </div>
+
+    <h3>The four lever groups (each one is a course concept in disguise)</h3>
+    <p>Every technique you learned for self-hosting has a client-side shadow. You can't <em>implement</em> it, but you can <strong>trigger the provider's version</strong> or <strong>reuse its principle</strong>.</p>
+
+    <div class="grid g2">
+      <div class="card">
+        <span class="tag">Input · fewer tokens in</span>
+        <h4>Shrink and cache the prompt</h4>
+        <p><strong>Compress context</strong> — RAG, summarize history, send only relevant chunks. That's <em>KV-cache-across-tokens</em> (Ch&nbsp;9) applied to the input you control. Then exploit <strong>provider prompt caching</strong>: put the stable system prompt + ERP tool schema <em>first</em>, behind a cache breakpoint, so repeated calls reuse the provider's KV cache — cheaper and lower TTFT. This is <em>prefix caching</em> (Ch&nbsp;12) and <em>cache-aware routing</em> (§4), triggered by how you order the request.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Output · fewer tokens out</span>
+        <h4>Control how much it generates</h4>
+        <p>Decode is sequential and you can't speed it per token — so emit <em>fewer</em> tokens. Set <code>max_tokens</code>, use <strong>stop sequences</strong>, ask for <strong>concise / structured output</strong> instead of prose, and <strong>stream</strong> so perceived TTFT stays low even if total time doesn't. The single biggest latency lever on an API is output length.</p>
+      </div>
+      <div class="card">
+        <span class="tag">Model choice · route &amp; cascade</span>
+        <h4>Pick the right model per request</h4>
+        <p>You can't change a model's internals, but you choose <em>which</em> model runs. Build a <strong>router / cascade</strong>: a cheap fast model (or a smaller tier) handles the routine 90% of POs; escalate the hard 10% to a frontier model. This is the <em>spirit</em> of speculative decoding (Ch&nbsp;15) at the request level — and <strong>Predicted Outputs</strong> (where you supply a likely answer to skip ahead) is literally speculative decoding exposed through the API. Picking a smaller tier is your <em>quantization</em> knob (Ch&nbsp;13): the cost/quality dial.</p>
+      </div>
+      <div class="card">
+        <span class="tag">System · around the call</span>
+        <h4>The best call is the one you skip</h4>
+        <p>Wrap the API in a <strong>semantic / response cache</strong> — if a similar PO request was answered before, serve it without calling at all (that's <em>RadixAttention / semantic caching</em>, Track&nbsp;5, at the app layer). Use the provider <strong>Batch API</strong> for offline jobs (§4 batch vs online — ~50% cheaper, async). <strong>Fan out concurrent requests</strong> to exploit <em>their</em> continuous batching, respecting rate limits with backoff.</p>
+      </div>
+    </div>
+
+    <h3>Self-hosting trick → its closed-API equivalent</h3>
+    <table>
+      <thead><tr><th>What you'd do self-hosting</th><th>Covered in</th><th>Closed-API equivalent you control</th></tr></thead>
+      <tbody>
+        <tr><td>Shrink KV cache (GQA/MLA, eviction)</td><td>Ch 8–9</td><td>Send fewer input tokens — RAG, summarize, trim the system prompt</td></tr>
+        <tr><td>Prefix caching / chunked prefill</td><td>Ch 11–12</td><td>Provider <b>prompt caching</b> — static content first, behind a cache breakpoint</td></tr>
+        <tr><td>FlashAttention / faster kernels</td><td>Ch 10</td><td>Nothing — locked. So spend the budget on the levers that <em>are</em> yours</td></tr>
+        <tr><td>Quantization (cheaper/faster)</td><td>Ch 13</td><td>Choose a smaller model <b>tier</b> (mini/flash/haiku) — the cost/quality dial</td></tr>
+        <tr><td>Speculative decoding</td><td>Ch 15</td><td><b>Predicted Outputs</b>; and request-level <b>model cascades</b></td></tr>
+        <tr><td>Continuous batching</td><td>Ch 14</td><td><b>Concurrency</b> (fan-out) + the <b>Batch API</b> for offline work</td></tr>
+        <tr><td>Constrained decoding (your FSM)</td><td>§1</td><td>Provider <b>JSON mode / structured outputs / function calling</b></td></tr>
+        <tr><td>Distillation to a smaller model</td><td>Ch 22</td><td>Provider <b>fine-tuning</b> — distill the behavior into a cheaper endpoint</td></tr>
+        <tr><td>The eval harness</td><td>§2</td><td>Matters <em>more</em> — you can only <b>switch</b> models, so gate every switch on evals</td></tr>
+      </tbody>
+    </table>
+
+    <h3>So how does an inference engineer stand out here?</h3>
+    <p>Anyone can call an endpoint. The engineers who distinguish themselves on closed APIs are the ones who:</p>
+    <ul>
+      <li><strong>Treat tokens as money and milliseconds.</strong> They instrument input/output token counts per request and engineer them down — the difference between a $40k/month bill and a $4k one is usually prompt design, not the model.</li>
+      <li><strong>Exploit prompt caching ruthlessly.</strong> Most teams leave 50–90% of repeated-prefix savings on the table because they don't structure requests for the provider's cache. The ones who do get cheaper <em>and</em> faster for free.</li>
+      <li><strong>Build routers and cascades.</strong> Hitting frontier quality at a fraction of the cost by sending only the hard requests to the expensive model — measured and tuned with evals.</li>
+      <li><strong>Cache at the application layer.</strong> The cheapest, fastest call is the one you never make.</li>
+      <li><strong>Run rigorous evals (§2).</strong> Because you can't patch the model, your only moves are <em>switch model</em>, <em>change prompt</em>, or <em>change routing</em> — and you can only do those confidently with a harness. Eval discipline is the closed-API engineer's superpower.</li>
+      <li><strong>Reason from the roofline anyway.</strong> Understanding <em>why</em> prefill is compute-bound and decode is memory-bound tells you why long outputs dominate latency and why cached prefixes are nearly free — so you structure every request to land in the provider's cheap path.</li>
+    </ul>
+
+    <div class="note">
+      <span class="label">The bottom line</span>
+      <p>On a closed API you give up the runtime and tooling layers but keep the <strong>infra layer, the eval harness, and full control of the request itself</strong>. The work shifts from <em>“make the GPU faster”</em> to <em>“send fewer, cheaper, cached tokens to the right model, and don't call when you don't have to.”</em> Same concepts from the course — KV reuse, prefix caching, speculation, quantization, batching, evals — just applied at the boundary instead of the kernel. That's the whole discipline.</p>
+    </div>
   </section>
 
 </main>
